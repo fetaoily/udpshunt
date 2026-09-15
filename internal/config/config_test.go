@@ -83,17 +83,18 @@ listeners:
 
 func TestValidationErrors(t *testing.T) {
 	cases := map[string]string{
-		"no listeners": "sessions:\n  timeout: 60s\n",
-		"missing name": "listeners:\n  - bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\n",
-		"bad bind":     "listeners:\n  - name: a\n    bind: not-an-addr\n    backends: [127.0.0.1:2]\n",
-		"no backends":  "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: []\n",
-		"bad backend":  "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [oops]\n",
-		"bad balance":  "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\n    balance: magic\n",
-		"bad timeout":  "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\n    session_timeout: -1s\n",
-		"bad level":    "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\nlogging:\n  level: loud\n",
-		"bad format":   "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\nlogging:\n  format: xml\n",
-		"bad yaml":     "listeners: [unclosed\n",
-		"bad duration": "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\n    session_timeout: soon\n",
+		"no listeners":   "sessions:\n  timeout: 60s\n",
+		"missing name":   "listeners:\n  - bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\n",
+		"bad bind":       "listeners:\n  - name: a\n    bind: not-an-addr\n    backends: [127.0.0.1:2]\n",
+		"no backends":    "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: []\n",
+		"bad backend":    "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [oops]\n",
+		"bad balance":    "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\n    balance: magic\n",
+		"bad timeout":    "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\n    session_timeout: -1s\n",
+		"bad level":      "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\nlogging:\n  level: loud\n",
+		"bad format":     "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\nlogging:\n  format: xml\n",
+		"bad yaml":       "listeners: [unclosed\n",
+		"bad duration":   "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\n    session_timeout: soon\n",
+		"duplicate name": "listeners:\n  - name: a\n    bind: 127.0.0.1:1\n    backends: [127.0.0.1:2]\n  - name: a\n    bind: 127.0.0.1:3\n    backends: [127.0.0.1:4]\n",
 	}
 	for name, yaml := range cases {
 		t.Run(name, func(t *testing.T) {

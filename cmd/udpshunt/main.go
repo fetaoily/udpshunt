@@ -62,10 +62,17 @@ func run() error {
 
 	<-ctx.Done()
 	logger.Info("shutting down")
+	// Spec §10: stop receiving, give downstream relays a flush window, close
+	// sessions, then close the frontend sockets.
 	for _, l := range ls {
-		l.WaitDownstream(2 * time.Second) // spec §10: drain window
+		l.WaitDownstream(2 * time.Second)
 	}
 	mgr.CloseAll()
+	for _, l := range ls {
+		if err := l.Close(); err != nil {
+			logger.Warn("close listener socket failed", "err", err)
+		}
+	}
 	return nil
 }
 

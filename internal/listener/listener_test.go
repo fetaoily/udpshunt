@@ -76,8 +76,12 @@ func newStack(t *testing.T, lc config.Listener, maxSessions int64) (*Listener, *
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	// Cleanups run LIFO: cancel (stop receiving) -> CloseAll (unblock
+	// downstream readers) -> Close (release the frontend socket). Run no
+	// longer closes the socket itself, so Close must happen here.
+	t.Cleanup(func() { _ = l.Close() })
 	t.Cleanup(func() { mgr.CloseAll() })
+	t.Cleanup(cancel)
 	go func() { _ = l.Run(ctx) }()
 	return l, bal, mgr
 }

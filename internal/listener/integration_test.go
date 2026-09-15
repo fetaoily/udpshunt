@@ -72,33 +72,44 @@ func TestBackendFailover(t *testing.T) {
 	lc := config.Listener{Name: "fail", Bind: "127.0.0.1:0", Backends: []string{dead, alive}, SessionTimeout: config.Duration(time.Minute)}
 	l, bal, _ := newStack(t, lc, 0)
 
-	client := testClient(t)
 	buf := make([]byte, 65536)
-	// The dead backend produces ICMP port-unreachable (Linux) or
-	// WSAECONNRESET (Windows) on its session socket; either surfaces as an
-	// error, feeds passive health, and kills the session. The client keeps
-	// retransmitting until round-robin lands on the live backend.
+	// On Linux the dead backend's session socket gets ECONNREFUSED from the
+	// ICMP port-unreachable on read; each error feeds passive health and
+	// kills the session. Sessions are sticky, so retransmitting from one
+	// client port would pin to the first healthy backend and stop feeding
+	// errors to the dead one; each retransmit therefore comes from a fresh
+	// client port (a new client flow), keeping round-robin offering the
+	// dead backend until it is evicted (3 consecutive errors). Keep going
+	// until BOTH the client is served AND the dead backend is unhealthy.
 	deadline := time.Now().Add(8 * time.Second)
 	ok := false
-	for time.Now().Before(deadline) && !ok {
+	down := false
+	for time.Now().Before(deadline) && !(ok && down) {
+		client := testClient(t)
 		_, _ = client.WriteToUDP([]byte("ping"), l.Addr())
 		client.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 		n, _, err := client.ReadFromUDP(buf)
 		if err == nil && string(buf[:n]) == "echo:ping" {
 			ok = true
 		}
+		down = backendDown(bal, dead)
 	}
 	if !ok {
 		t.Fatal("failover to the healthy backend did not happen within deadline")
 	}
-	eventually(t, 8*time.Second, "dead backend marked down", func() bool {
-		for _, st := range bal.Snapshot() {
-			if st.Addr == dead && !st.Healthy {
-				return true
-			}
+	if !down {
+		t.Fatal("dead backend was not marked down within deadline")
+	}
+}
+
+// backendDown reports whether bal shows addr as unhealthy.
+func backendDown(bal *balancer.Balancer, addr string) bool {
+	for _, st := range bal.Snapshot() {
+		if st.Addr == addr {
+			return !st.Healthy
 		}
-		return false
-	})
+	}
+	return false
 }
 
 func TestSessionCapDropsNewClients(t *testing.T) {
@@ -123,9 +134,9 @@ func TestSessionCapDropsNewClients(t *testing.T) {
 }
 
 func TestGracefulShutdown(t *testing.T) {
-	// Drain sequencing (stop receiving -> flush window -> CloseAll) is wired
-	// in cmd/udpshunt (Task 6); this test proves the component contract:
-	// Run returns nil, CloseAll unblocks downstream readers, no leaks.
+	// Drain sequencing (spec §10): cancellation stops the receive loop but
+	// leaves the frontend socket writable for the flush window; CloseAll
+	// unblocks downstream readers; Close then releases the socket.
 	// Dedicated stack (not newStack) so its context can be cancelled
 	// independently of newStack's t.Cleanup.
 	backend := startEcho(t)
@@ -154,9 +165,20 @@ func TestGracefulShutdown(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after cancellation")
 	}
+	// The drain window requires the frontend socket to stay open (writable)
+	// after Run returned.
+	if _, err := l.pc.WriteToUDP([]byte("drain"), client.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("frontend socket not writable after Run returned: %v", err)
+	}
 	mgr.CloseAll()
 	if mgr.Count() != 0 {
 		t.Fatalf("count = %d, want 0 after CloseAll", mgr.Count())
 	}
 	l.WaitDownstream(500 * time.Millisecond)
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("second Close returned error (must be idempotent): %v", err)
+	}
 }

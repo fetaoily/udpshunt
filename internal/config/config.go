@@ -91,10 +91,15 @@ func (c Config) Validate() error {
 	if len(c.Listeners) == 0 {
 		return fmt.Errorf("at least one listener is required")
 	}
+	seen := make(map[string]bool, len(c.Listeners))
 	for i, l := range c.Listeners {
 		if l.Name == "" {
 			return fmt.Errorf("listeners[%d]: name is required", i)
 		}
+		if seen[l.Name] {
+			return fmt.Errorf("listeners[%d] (%s): duplicate name", i, l.Name)
+		}
+		seen[l.Name] = true
 		if _, err := net.ResolveUDPAddr("udp", l.Bind); err != nil {
 			return fmt.Errorf("listeners[%d] (%s): invalid bind %q: %w", i, l.Name, l.Bind, err)
 		}

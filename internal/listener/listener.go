@@ -5,6 +5,7 @@ package listener
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -18,16 +19,23 @@ import (
 const maxPacketSize = 65536
 
 type Listener struct {
-	name    string
-	pc      *net.UDPConn
-	bal     *balancer.Balancer
-	mgr     *session.Manager
-	timeout time.Duration
-	logger  *slog.Logger
-	wg      sync.WaitGroup // downstream goroutines
+	name     string
+	pc       *net.UDPConn
+	bal      *balancer.Balancer
+	mgr      *session.Manager
+	timeout  time.Duration
+	logger   *slog.Logger
+	resolved map[string]*net.UDPAddr // backend address -> pre-resolved address
+
+	mu        sync.Mutex // guards stopped and the wg.Add in startDownstream
+	stopped   bool       // set once draining: no new downstream goroutines
+	wg        sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
 }
 
-// New binds the frontend UDP socket described by cfg.Bind.
+// New binds the frontend UDP socket described by cfg.Bind and resolves every
+// backend address once so the receive loop never pays for DNS on new sessions.
 func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.Manager, logger *slog.Logger) (*Listener, error) {
 	addr, err := net.ResolveUDPAddr("udp", cfg.Bind)
 	if err != nil {
@@ -37,13 +45,23 @@ func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.
 	if err != nil {
 		return nil, err
 	}
+	resolved := make(map[string]*net.UDPAddr, len(cfg.Backends))
+	for _, b := range cfg.Backends {
+		ra, err := net.ResolveUDPAddr("udp", b)
+		if err != nil {
+			pc.Close()
+			return nil, fmt.Errorf("resolve backend %q: %w", b, err)
+		}
+		resolved[b] = ra
+	}
 	return &Listener{
-		name:    name,
-		pc:      pc,
-		bal:     bal,
-		mgr:     mgr,
-		timeout: time.Duration(cfg.SessionTimeout),
-		logger:  logger.With("listener", name),
+		name:     name,
+		pc:       pc,
+		bal:      bal,
+		mgr:      mgr,
+		timeout:  time.Duration(cfg.SessionTimeout),
+		logger:   logger.With("listener", name),
+		resolved: resolved,
 	}, nil
 }
 
@@ -52,21 +70,42 @@ func (l *Listener) Addr() *net.UDPAddr {
 	return l.pc.LocalAddr().(*net.UDPAddr)
 }
 
-// Run receives packets until ctx is cancelled (which closes the socket).
+// Close closes the frontend socket (single close point). It is safe to call
+// after Run has returned and safe to call more than once.
+func (l *Listener) Close() error {
+	l.closeOnce.Do(func() { l.closeErr = l.pc.Close() })
+	return l.closeErr
+}
+
+// Run receives packets until ctx is cancelled. Cancellation stops the receive
+// loop without closing the socket: it must stay writable for the downstream
+// drain window; call Close once draining is done (spec §10).
 func (l *Listener) Run(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
-		l.pc.Close()
+		// Unblock the pending ReadFromUDP via an already-expired read
+		// deadline instead of closing the socket.
+		_ = l.pc.SetReadDeadline(time.Now())
 	}()
 	buf := make([]byte, maxPacketSize)
 	for {
 		n, client, err := l.pc.ReadFromUDP(buf)
 		if err != nil {
+			if ctx.Err() != nil {
+				// Cancellation path: the watcher's read deadline unblocked
+				// the pending read; stop receiving cleanly.
+				return nil
+			}
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			l.logger.Warn("read from frontend failed", "err", err)
 			continue
+		}
+		if ctx.Err() != nil {
+			// A buffered packet slipped through as cancellation fired; drop
+			// it instead of creating sessions during shutdown.
+			return nil
 		}
 		l.handle(client, buf[:n])
 	}
@@ -88,7 +127,9 @@ func (l *Listener) handle(client *net.UDPAddr, pkt []byte) {
 		l.mgr.Remove(l.name, client)
 		return
 	}
-	l.bal.ReportSuccess(s.Backend)
+	// No ReportSuccess here: a locally successful UDP write says nothing
+	// about backend liveness; only a relayed reply (downstream) is a
+	// liveness signal.
 }
 
 // createSession picks a backend, dials the upstream socket and starts the
@@ -96,10 +137,18 @@ func (l *Listener) handle(client *net.UDPAddr, pkt []byte) {
 // established or stored.
 func (l *Listener) createSession(client *net.UDPAddr) *session.Session {
 	backendAddr := l.bal.Pick()
-	raddr, err := net.ResolveUDPAddr("udp", backendAddr)
-	if err != nil {
-		l.logger.Error("unresolvable backend address", "backend", backendAddr, "err", err)
-		return nil
+	raddr, ok := l.resolved[backendAddr]
+	if !ok {
+		// Should not happen (New pre-resolves every configured backend);
+		// resolve on demand rather than silently drop traffic.
+		var err error
+		raddr, err = net.ResolveUDPAddr("udp", backendAddr)
+		if err != nil {
+			l.logger.Error("unresolvable backend address", "backend", backendAddr, "err", err)
+			return nil
+		}
+		l.logger.Error("backend address missing from startup resolution, resolved on demand", "backend", backendAddr)
+		l.resolved[backendAddr] = raddr
 	}
 	up, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
@@ -113,10 +162,26 @@ func (l *Listener) createSession(client *net.UDPAddr) *session.Session {
 		l.logger.Debug("session rejected (cap or duplicate), dropping packet", "client", client)
 		return nil
 	}
-	l.wg.Add(1)
-	go l.downstream(s)
+	if !l.startDownstream(s) {
+		l.mgr.Remove(l.name, client)
+		return nil
+	}
 	l.logger.Debug("session created", "client", client, "backend", backendAddr)
 	return s
+}
+
+// startDownstream spawns the downstream relay for s. The stopped check and
+// the wg.Add share the mutex so a drain-time wg.Wait cannot race a late
+// wg.Add; it returns false once the listener is draining.
+func (l *Listener) startDownstream(s *session.Session) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.stopped {
+		return false
+	}
+	l.wg.Add(1)
+	go l.downstream(s)
+	return true
 }
 
 // downstream relays backend replies back to the client through the
@@ -147,8 +212,12 @@ func (l *Listener) downstream(s *session.Session) {
 }
 
 // WaitDownstream waits up to maxWait for downstream goroutines to finish
-// (the graceful-shutdown drain window, spec §10).
+// (the graceful-shutdown drain window, spec §10). Once called, no new
+// downstream goroutines are spawned.
 func (l *Listener) WaitDownstream(maxWait time.Duration) {
+	l.mu.Lock()
+	l.stopped = true
+	l.mu.Unlock()
 	done := make(chan struct{})
 	go func() {
 		l.wg.Wait()
