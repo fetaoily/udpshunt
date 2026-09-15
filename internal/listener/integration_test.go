@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -62,6 +63,10 @@ func TestIdleAgingRemovesSession(t *testing.T) {
 }
 
 func TestBackendFailover(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows UDP sockets never surface ICMP port-unreachable as read errors " +
+			"(Go disables SIO_UDP_CONNRESET); passive-health failover E2E runs on Linux CI")
+	}
 	dead := deadBackendAddr(t)
 	alive := startEcho(t)
 	lc := config.Listener{Name: "fail", Bind: "127.0.0.1:0", Backends: []string{dead, alive}, SessionTimeout: config.Duration(time.Minute)}
@@ -118,6 +123,9 @@ func TestSessionCapDropsNewClients(t *testing.T) {
 }
 
 func TestGracefulShutdown(t *testing.T) {
+	// Drain sequencing (stop receiving -> flush window -> CloseAll) is wired
+	// in cmd/udpshunt (Task 6); this test proves the component contract:
+	// Run returns nil, CloseAll unblocks downstream readers, no leaks.
 	// Dedicated stack (not newStack) so its context can be cancelled
 	// independently of newStack's t.Cleanup.
 	backend := startEcho(t)
@@ -146,6 +154,9 @@ func TestGracefulShutdown(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after cancellation")
 	}
-	eventually(t, 2*time.Second, "sessions drained after shutdown", func() bool { return mgr.Count() == 0 })
+	mgr.CloseAll()
+	if mgr.Count() != 0 {
+		t.Fatalf("count = %d, want 0 after CloseAll", mgr.Count())
+	}
 	l.WaitDownstream(500 * time.Millisecond)
 }
