@@ -1,0 +1,14 @@
+listeners:
+  - name: demo
+    bind: 127.0.0.1:19000
+    backends: [127.0.0.1:19001]
+    balance: round_robin
+    session_timeout: 60s
+
+sessions:
+  timeout: 60s
+  max: 0
+
+logging:
+  level: debug
+  format: text
