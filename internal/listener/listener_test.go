@@ -77,6 +77,7 @@ func newStack(t *testing.T, lc config.Listener, maxSessions int64) (*Listener, *
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	t.Cleanup(func() { mgr.CloseAll() })
 	go func() { _ = l.Run(ctx) }()
 	return l, bal, mgr
 }
