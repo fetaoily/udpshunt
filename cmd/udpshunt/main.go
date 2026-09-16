@@ -13,6 +13,7 @@ import (
 
 	"github.com/fetaoily/udpshunt/internal/admin"
 	"github.com/fetaoily/udpshunt/internal/config"
+	"github.com/fetaoily/udpshunt/internal/tui"
 )
 
 func main() {
@@ -23,6 +24,9 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "tui" {
+		return runTUI(os.Args[2:])
+	}
 	cfgPath := flag.String("c", "/etc/udpshunt.yaml", "path to YAML config file")
 	flag.Parse()
 
@@ -74,6 +78,17 @@ func run() error {
 	// window, close sessions, then close the frontend sockets.
 	app.Shutdown(2 * time.Second)
 	return nil
+}
+
+// runTUI runs the terminal dashboard against a running udpshunt's admin API.
+func runTUI(args []string) error {
+	fs := flag.NewFlagSet("tui", flag.ContinueOnError)
+	addr := fs.String("addr", "http://127.0.0.1:9155", "admin API base URL")
+	interval := fs.Duration("interval", time.Second, "poll interval")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return tui.Run(*addr, *interval)
 }
 
 func newLogger(lc config.Logging) *slog.Logger {

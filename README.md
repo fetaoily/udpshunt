@@ -71,6 +71,19 @@ what is running.
 - `GET /status` — JSON snapshot: uptime, per-listener backends (health, session counts), session totals, recent events.
 - `POST /reload` — reload the config file and apply it.
 
+## Terminal dashboard
+
+`udpshunt tui` renders a live dashboard (uptime, totals, per-listener
+sparklines, backend health, recent events) from a running udpshunt's admin
+API — the daemon itself must already be running:
+
+    udpshunt tui --addr http://127.0.0.1:9155 --interval 1s
+
+- `--addr` — admin API base URL (default `http://127.0.0.1:9155`).
+- `--interval` — poll interval (default `1s`).
+
+Press `q` or Ctrl-C to quit.
+
 ## Hot reload
 
 Both `kill -HUP <pid>` (not delivered on Windows) and
