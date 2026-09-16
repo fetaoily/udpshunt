@@ -1,0 +1,308 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+	"time"
+
+	"go.uber.org/goleak"
+
+	"github.com/fetaoily/udpshunt/internal/admin"
+	"github.com/fetaoily/udpshunt/internal/config"
+)
+
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
+
+func startEcho(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			n, from, err := pc.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			_, _ = pc.WriteToUDP(append([]byte("echo:"), buf[:n]...), from)
+		}
+	}()
+	t.Cleanup(func() { pc.Close() })
+	return pc.LocalAddr().String()
+}
+
+func writeCfg(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "udpshunt.yaml")
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func cfgYAML(listeners string, extra string) string {
+	return fmt.Sprintf("listeners:\n%s%s\n", listeners, extra)
+}
+
+func newApp(t *testing.T, cfgPath string) (*App, context.CancelFunc) {
+	t.Helper()
+	app := NewApp(cfgPath, slog.Default())
+	// The cancel is wired into t.Cleanup; no test needs the ctx itself.
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		app.Shutdown(500 * time.Millisecond)
+	})
+	return app, cancel
+}
+
+func roundTripUDP(t *testing.T, dst *net.UDPAddr, payload string) (string, error) {
+	t.Helper()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	_, _ = pc.WriteToUDP([]byte(payload), dst)
+	pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 65536)
+	n, _, err := pc.ReadFromUDP(buf)
+	if err != nil {
+		return "", err
+	}
+	return string(buf[:n]), nil
+}
+
+func mustLoad(t *testing.T, path string) config.Config {
+	t.Helper()
+	c, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func TestReloadListenerLifecycle(t *testing.T) {
+	b1 := startEcho(t)
+	b2 := startEcho(t)
+	p1 := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1), ""))
+	app, _ := newApp(t, p1)
+	if err := app.Apply(context.Background(), mustLoad(t, p1)); err != nil {
+		t.Fatal(err)
+	}
+	l1 := app.listeners["L1"].Addr()
+	if got, err := roundTripUDP(t, l1, "hi"); err != nil || got != "echo:hi" {
+		t.Fatalf("L1 round trip: %q %v", got, err)
+	}
+
+	p2 := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L2\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b2), ""))
+	if err := app.Apply(context.Background(), mustLoad(t, p2)); err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	_, l1Alive := app.listeners["L1"]
+	l2 := app.listeners["L2"]
+	app.mu.Unlock()
+	if l1Alive {
+		t.Fatal("L1 must be removed after reload")
+	}
+	if l2 == nil {
+		t.Fatal("L2 must be running after reload")
+	}
+	if got, err := roundTripUDP(t, l2.Addr(), "yo"); err != nil || got != "echo:yo" {
+		t.Fatalf("L2 round trip: %q %v", got, err)
+	}
+	// BackendCounts is not used here: its underlying counter map keeps
+	// zero-valued keys, so an empty result must be asserted per backend.
+	if n := app.mgr.BackendCount("L1", b1); n != 0 {
+		t.Fatalf("L1 sessions must be closed, got %d", n)
+	}
+}
+
+func TestReloadInvalidConfigKeepsServing(t *testing.T) {
+	b1 := startEcho(t)
+	p := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1), ""))
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	addr := app.listeners["L1"].Addr()
+
+	bad := writeCfg(t, "listeners: [broken\n")
+	app.cfgPath = bad
+	if err := app.Reload(); err == nil {
+		t.Fatal("reload of invalid config must fail")
+	}
+	if got, err := roundTripUDP(t, addr, "ok"); err != nil || got != "echo:ok" {
+		t.Fatal("previous config must keep serving after failed reload")
+	}
+}
+
+func TestReloadBackendChangeEvictsSessions(t *testing.T) {
+	b1 := startEcho(t)
+	b2 := startEcho(t)
+	p := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1), ""))
+	app, _ := newApp(t, p)
+	_ = app.Apply(context.Background(), mustLoad(t, p))
+	l1 := app.listeners["L1"].Addr()
+	if got, err := roundTripUDP(t, l1, "x"); err != nil || got != "echo:x" {
+		t.Fatalf("setup round trip: %q %v", got, err)
+	}
+	if n := app.mgr.BackendCount("L1", b1); n != 1 {
+		t.Fatalf("one session on b1 expected, got %d", n)
+	}
+
+	p2 := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b2), ""))
+	if err := app.Apply(context.Background(), mustLoad(t, p2)); err != nil {
+		t.Fatal(err)
+	}
+	if n := app.mgr.BackendCount("L1", b1); n != 0 {
+		t.Fatalf("removed backend sessions must be evicted, got %d", n)
+	}
+	if got, err := roundTripUDP(t, l1, "y"); err != nil || got != "echo:y" {
+		t.Fatalf("traffic must move to b2: %q %v", got, err)
+	}
+}
+
+func TestHealthCheckFailoverE2E(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Active checks use timeouts (cross-platform), but the failover
+		// retransmission relies on errors from session sockets, which
+		// Windows does not surface (see M1). Probe state itself is tested
+		// in internal/health; here we assert failover, which is Linux CI.
+		t.Skip("failover E2E runs on Linux CI")
+	}
+	dead := deadAddr(t)
+	alive := startEcho(t)
+	p := writeCfg(t, fmt.Sprintf(`
+listeners:
+  - name: L1
+    bind: 127.0.0.1:0
+    backends: [%s, %s]
+    session_timeout: 60s
+    health_check:
+      mode: raw
+      payload: "70696e67"
+      interval: 100ms
+      timeout: 60ms
+      rise: 1
+      fall: 2
+`, dead, alive))
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	l1 := app.listeners["L1"].Addr()
+	deadline := time.Now().Add(8 * time.Second)
+	ok := false
+	for time.Now().Before(deadline) && !ok {
+		if got, err := roundTripUDP(t, l1, "ping"); err == nil && got == "echo:ping" {
+			ok = true
+		}
+	}
+	if !ok {
+		t.Fatal("did not fail over to the healthy backend in time")
+	}
+	deadline = time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		app.mu.Lock()
+		bal := app.balancers["L1"]
+		app.mu.Unlock()
+		down := false
+		for _, st := range bal.Snapshot() {
+			if st.Addr == dead && !st.Healthy {
+				down = true
+			}
+		}
+		if down {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("prober did not mark the dead backend down")
+}
+
+func deadAddr(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := pc.LocalAddr().String()
+	pc.Close()
+	return addr
+}
+
+func TestStatusAndAdminEndpoints(t *testing.T) {
+	b1 := startEcho(t)
+	p := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1), ""))
+	app, _ := newApp(t, p)
+	_ = app.Apply(context.Background(), mustLoad(t, p))
+	if got, err := roundTripUDP(t, app.listeners["L1"].Addr(), "s"); err != nil || got != "echo:s" {
+		t.Fatalf("setup: %q %v", got, err)
+	}
+
+	raw, err := json.Marshal(app.Status())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st admin.Status
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Listeners) != 1 || st.Listeners[0].Name != "L1" {
+		t.Fatalf("status listeners: %+v", st.Listeners)
+	}
+	if len(st.Listeners[0].Backends) != 1 || !st.Listeners[0].Backends[0].Healthy {
+		t.Fatalf("status backends: %+v", st.Listeners[0].Backends)
+	}
+	if st.Sessions.Created < 1 || st.Sessions.Active < 1 {
+		t.Fatalf("status sessions: %+v", st.Sessions)
+	}
+
+	// POST /reload must 500 only when the file is invalid; the brief's
+	// draft left cfgPath pointing at the valid config (which reloads 204),
+	// so point it at a broken one first.
+	app.cfgPath = writeCfg(t, "listeners: [broken\n")
+	ts := httptest.NewServer(admin.New("127.0.0.1:0", admin.Deps{
+		Registry: app.met.Registry(),
+		Status:   app.Status,
+		Reload:   app.Reload,
+		Logger:   slog.Default(),
+	}).Handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/metrics")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics: %v %v", err, resp)
+	}
+	resp.Body.Close()
+	if resp2, err := http.Post(ts.URL+"/reload", "", nil); err != nil || resp2.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("reload of invalid path must 500: %v %v", err, resp2)
+	} else {
+		resp2.Body.Close()
+	}
+	kinds := map[string]bool{}
+	for _, ev := range app.events.List() {
+		kinds[ev.Kind] = true
+	}
+	if !kinds["listener_started"] || !kinds["reload_failed"] {
+		t.Fatalf("events must record listener_started and reload_failed, got %+v", app.events.List())
+	}
+}
