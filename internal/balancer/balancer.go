@@ -222,9 +222,13 @@ func (b *Balancer) usable(be *backend, o *Options) (usable, recovered bool) {
 		return false, false // recovery only via ReportSuccess rise path
 	}
 	if time.Since(time.Unix(0, be.downSince.Load())) >= o.Cooldown {
-		// errCount is zeroed before the flip so an observer of the
-		// flipped-up state never sees the stale >= Fall streak; a CAS
-		// loser's zeroing is inert.
+		// errCount is zeroed before the flip, which removes the systematic
+		// window: an observer of the flipped-up state no longer routinely
+		// sees the stale >= Fall streak. Residual: a ReportError exactly
+		// concurrent with the recovery can still observe the stale count
+		// and re-down the backend — fail-closed, same pathological-scheduler
+		// family as the documented CAS-loser residuals; a CAS loser's
+		// zeroing is inert.
 		be.errCount.Store(0)
 		if be.healthy.CompareAndSwap(false, true) {
 			return true, true
@@ -318,11 +322,14 @@ func (b *Balancer) ReportSuccess(addr string) {
 		return
 	}
 	if be.successCount.Add(1) >= int64(o.Rise) {
-		// Counters are zeroed before the flip: an observer of the
-		// flipped-up state must never see the stale >= Fall error streak,
-		// or a single concurrent error could re-down a fresh recovery. A
-		// CAS loser's zeroing is inert — the counters restart on the next
-		// down entry.
+		// Counters are zeroed before the flip, which removes the systematic
+		// window: an observer of the flipped-up state no longer routinely
+		// sees the stale >= Fall error streak. Residual: a ReportError
+		// exactly concurrent with the recovery's completing success can
+		// still observe the stale count and re-down a fresh recovery —
+		// fail-closed, same pathological-scheduler family as the documented
+		// CAS-loser residuals. A CAS loser's zeroing is inert — the
+		// counters restart on the next down entry.
 		be.errCount.Store(0)
 		be.successCount.Store(0)
 		if be.healthy.CompareAndSwap(false, true) {

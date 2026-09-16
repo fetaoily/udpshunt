@@ -122,6 +122,18 @@ func (l *Listener) Run(ctx context.Context) error {
 	sizes := make([]int, recvBatchSize)
 	for {
 		n, err := l.io.ReceiveBatch(bufs, addrs, sizes)
+		if ctx.Err() != nil {
+			// A buffered packet slipped through as cancellation fired; drop
+			// it instead of creating sessions during shutdown.
+			return nil
+		}
+		// Drain the packets already received before handling the error: a
+		// partial batch (deadline expiry during shutdown) must not be dropped.
+		for i := 0; i < n; i++ {
+			l.met.PacketsIn(1)
+			l.met.BytesIn(sizes[i])
+			l.handle(addrs[i], bufs[i][:sizes[i]])
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -131,16 +143,6 @@ func (l *Listener) Run(ctx context.Context) error {
 			}
 			l.logger.Warn("read from frontend failed", "err", err)
 			continue
-		}
-		if ctx.Err() != nil {
-			// A buffered packet slipped through as cancellation fired; drop
-			// it instead of creating sessions during shutdown.
-			return nil
-		}
-		for i := 0; i < n; i++ {
-			l.met.PacketsIn(1)
-			l.met.BytesIn(sizes[i])
-			l.handle(addrs[i], bufs[i][:sizes[i]])
 		}
 	}
 }

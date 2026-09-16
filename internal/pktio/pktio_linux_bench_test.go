@@ -31,6 +31,7 @@ func drainBatch(c *Conn, bufs [][]byte, addrs []*net.UDPAddr, sizes []int, want 
 	for got < want {
 		n, err := c.ReceiveBatch(bufs, addrs, sizes)
 		if err != nil {
+			got += n
 			continue
 		}
 		got += n

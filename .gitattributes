@@ -1,3 +1,7 @@
 *.go text eol=lf
 *.yaml text eol=lf
+*.yml text eol=lf
 *.md text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+.gitignore text eol=lf

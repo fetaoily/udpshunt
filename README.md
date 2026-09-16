@@ -94,12 +94,14 @@ Metric families: `udpshunt_packets_in_total`, `udpshunt_bytes_in_total`,
 
 When running many listeners or sessions, set `GOMEMLIMIT` to roughly 80% of
 the container or host memory budget so the Go GC targets that limit instead of
-growing until the kernel OOM-kills the process.
+growing until the kernel OOM-kills the process. `GOMEMLIMIT` governs the Go
+heap only: kernel socket buffers and the receive arena are outside it.
 
 Each listener holds ~4 MiB of kernel receive buffers by default (see
-`read_buffer` above), plus a 64×64 KiB receive arena and pooled relay buffers
-(relay memory scales with in-flight packets, not live sessions). Size
-`GOMEMLIMIT` with that baseline in mind.
+`read_buffer` above; Linux doubles `SO_RCVBUF` requests, so 4 MiB requested
+is about an 8 MiB kernel ceiling), plus a 64×64 KiB receive arena and pooled
+relay buffers (relay memory scales with in-flight packets, not live
+sessions). Size `GOMEMLIMIT` with that baseline in mind.
 
 ## Performance
 
