@@ -97,8 +97,22 @@ the container or host memory budget so the Go GC targets that limit instead of
 growing until the kernel OOM-kills the process.
 
 Each listener holds ~4 MiB of kernel receive buffers by default (see
-`read_buffer` above), plus in-process packet batch buffers sized in upcoming
-work. Size `GOMEMLIMIT` with that baseline in mind.
+`read_buffer` above), plus a 64×64 KiB receive arena and pooled relay buffers
+(relay memory scales with in-flight packets, not live sessions). Size
+`GOMEMLIMIT` with that baseline in mind.
+
+## Performance
+
+Frontend receives are batched: one `recvmmsg` (up to 64 packets per wakeup)
+on Linux, single-packet reads as the portable fallback.
+
+    go test ./internal/listener/ -bench . -benchtime 2s -run '^$' -count=3
+    # Linux only (batch path):
+    go test ./internal/pktio/ -bench . -benchtime 2s -run '^$'
+
+Measured numbers, the spec-target gap analysis and the SO_REUSEPORT
+deferral live in `docs/benchmarks.md`. Pair benchmark runs with the
+`GOMEMLIMIT` guidance above.
 
 ## Development
 
