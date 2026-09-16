@@ -95,6 +95,15 @@ func configHasListener(cfg config.Config, name string) bool {
 	return false
 }
 
+func hasBackend(addrs []string, addr string) bool {
+	for _, a := range addrs {
+		if a == addr {
+			return true
+		}
+	}
+	return false
+}
+
 func boundOf(cfg config.Config, name string) string {
 	for _, l := range cfg.Listeners {
 		if l.Name == name {
@@ -157,6 +166,14 @@ func (a *App) startProbeLocked(ctx context.Context, lc config.Listener) {
 
 func (a *App) updateListenerLocked(lc config.Listener) {
 	bal := a.balancers[lc.Name]
+	// spec §3: a backend leaving the pool terminates its sessions. Diff the
+	// live pool (not a.cfg, which a failed Apply may have left stale), then
+	// repool and evict.
+	for _, old := range bal.Snapshot() {
+		if !hasBackend(lc.Backends, old.Addr) {
+			a.mgr.CloseBackend(lc.Name, old.Addr)
+		}
+	}
 	bal.Update(lc.Backends)
 	bal.SetBalance(lc.Balance)
 	bal.SetHealth(healthEnabled(lc.HealthCheck), lc.HealthCheck.Rise, lc.HealthCheck.Fall)
