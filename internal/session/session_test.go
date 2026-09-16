@@ -2,7 +2,9 @@ package session
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,5 +167,110 @@ func TestTouchPreventsAging(t *testing.T) {
 	}
 	if mgr.Count() != 1 {
 		t.Fatal("touched session must survive past its timeout")
+	}
+}
+
+func TestExactCapUnderConcurrency(t *testing.T) {
+	const max = 50
+	mgr := NewManager(max)
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 25; i++ {
+				cli := testAddr(t, fmt.Sprintf("127.0.0.1:%d", 10000+w*100+i))
+				s := NewSession("L", cli, "b:1", testUpstream(t), time.Minute)
+				if !mgr.Put("L", cli, s) {
+					s.Close()
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	if mgr.Count() > max {
+		t.Fatalf("cap violated: %d > %d", mgr.Count(), max)
+	}
+	if mgr.Count() < max {
+		t.Fatalf("expected the pool to fill to the cap, got %d", mgr.Count())
+	}
+}
+
+func TestBackendCountsLifecycle(t *testing.T) {
+	mgr := NewManager(0)
+	a := testAddr(t, "127.0.0.1:1111")
+	b := testAddr(t, "127.0.0.1:2222")
+	mgr.Put("L", a, NewSession("L", a, "b:1", testUpstream(t), time.Minute))
+	mgr.Put("L", b, NewSession("L", b, "b:2", testUpstream(t), time.Minute))
+	mgr.Put("L2", a, NewSession("L2", a, "b:1", testUpstream(t), time.Minute))
+	if got := mgr.BackendCount("L", "b:1"); got != 1 {
+		t.Fatalf("BackendCount(L,b:1) = %d", got)
+	}
+	all := mgr.BackendCounts("L")
+	if len(all) != 2 || all["b:1"] != 1 || all["b:2"] != 1 {
+		t.Fatalf("BackendCounts(L) = %v", all)
+	}
+	mgr.Remove("L", a)
+	if got := mgr.BackendCount("L", "b:1"); got != 0 {
+		t.Fatalf("after Remove = %d", got)
+	}
+	if got := mgr.BackendCount("L2", "b:1"); got != 1 {
+		t.Fatalf("L2 unaffected = %d", got)
+	}
+}
+
+func TestBackendCountsExpireWithSweep(t *testing.T) {
+	mgr := NewManager(0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr.Start(ctx, 20*time.Millisecond)
+	cli := testAddr(t, "127.0.0.1:1111")
+	mgr.Put("L", cli, NewSession("L", cli, "b:9", testUpstream(t), 80*time.Millisecond))
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && mgr.BackendCount("L", "b:9") != 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := mgr.BackendCount("L", "b:9"); got != 0 {
+		t.Fatalf("sweep must decrement backend counts, got %d", got)
+	}
+}
+
+func TestCloseListenerScoped(t *testing.T) {
+	mgr := NewManager(0)
+	a := testAddr(t, "127.0.0.1:1111")
+	mgr.Put("L1", a, NewSession("L1", a, "b:1", testUpstream(t), time.Minute))
+	mgr.Put("L2", a, NewSession("L2", a, "b:1", testUpstream(t), time.Minute))
+	if n := mgr.CloseListener("L1"); n != 1 {
+		t.Fatalf("closed %d, want 1", n)
+	}
+	if mgr.Count() != 1 || mgr.Get("L2", a) == nil {
+		t.Fatal("L2 must survive")
+	}
+}
+
+func TestSetMaxLive(t *testing.T) {
+	mgr := NewManager(0)
+	a := testAddr(t, "127.0.0.1:1111")
+	b := testAddr(t, "127.0.0.1:2222")
+	mgr.Put("L", a, NewSession("L", a, "b:1", testUpstream(t), time.Minute))
+	mgr.SetMax(1)
+	if mgr.Put("L", b, NewSession("L", b, "b:1", testUpstream(t), time.Minute)) {
+		t.Fatal("live max must reject")
+	}
+}
+
+func TestLifecycleCounters(t *testing.T) {
+	mgr := NewManager(1)
+	a := testAddr(t, "127.0.0.1:1111")
+	mgr.Put("L", a, NewSession("L", a, "b:1", testUpstream(t), time.Minute))
+	if mgr.Created() != 1 {
+		t.Fatalf("Created = %d", mgr.Created())
+	}
+	mgr.Remove("L", a)
+	if mgr.Expired() != 1 {
+		t.Fatalf("Expired = %d", mgr.Expired())
+	}
+	if mgr.Rejected() < 0 || mgr.Created() < 1 {
+		t.Fatal("counters must be monotonic")
 	}
 }

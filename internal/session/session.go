@@ -4,6 +4,7 @@ package session
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,7 +54,10 @@ type Manager struct {
 	shards   [shardCount]shard
 	count    atomic.Int64
 	rejected atomic.Int64
-	max      int64
+	created  atomic.Int64
+	expired  atomic.Int64
+	max      atomic.Int64
+	bcounts  sync.Map // "listener|backend" -> *atomic.Int64
 }
 
 type shard struct {
@@ -63,7 +67,8 @@ type shard struct {
 
 // NewManager creates a session table. max <= 0 means unlimited sessions.
 func NewManager(max int64) *Manager {
-	mgr := &Manager{max: max}
+	mgr := &Manager{}
+	mgr.max.Store(max)
 	for i := range mgr.shards {
 		mgr.shards[i].m = make(map[string]*Session)
 	}
@@ -97,20 +102,29 @@ func (m *Manager) Get(listener string, client *net.UDPAddr) *Session {
 // the key already exists; the caller must then Close the session it tried to
 // insert.
 func (m *Manager) Put(listener string, client *net.UDPAddr, s *Session) bool {
-	if m.max > 0 && m.count.Load() >= m.max {
-		m.rejected.Add(1)
-		return false
+	if max := m.max.Load(); max > 0 {
+		// Reserve a slot atomically: the cap can never be exceeded even
+		// under concurrent Puts (reserve, roll back on any failure).
+		if m.count.Add(1) > max {
+			m.count.Add(-1)
+			m.rejected.Add(1)
+			return false
+		}
+	} else {
+		m.count.Add(1)
 	}
 	k := key(listener, client)
 	sh := m.shardFor(k)
 	sh.mu.Lock()
 	if _, dup := sh.m[k]; dup {
 		sh.mu.Unlock()
+		m.count.Add(-1)
 		return false
 	}
 	sh.m[k] = s
 	sh.mu.Unlock()
-	m.count.Add(1)
+	m.created.Add(1)
+	m.bcount(listener, s.Backend).Add(1)
 	return true
 }
 
@@ -127,6 +141,8 @@ func (m *Manager) Remove(listener string, client *net.UDPAddr) {
 	if ok {
 		s.Close()
 		m.count.Add(-1)
+		m.expired.Add(1)
+		m.bcount(listener, s.Backend).Add(-1)
 	}
 }
 
@@ -153,6 +169,8 @@ func (m *Manager) closeWhere(match func(*Session) bool) int {
 			if match(s) {
 				delete(sh.m, k)
 				s.Close()
+				m.expired.Add(1)
+				m.bcount(s.Listener, s.Backend).Add(-1)
 				closed++
 			}
 		}
@@ -192,6 +210,8 @@ func (m *Manager) sweep(offset, n int) {
 				delete(sh.m, k)
 				s.Close()
 				m.count.Add(-1)
+				m.expired.Add(1)
+				m.bcount(s.Listener, s.Backend).Add(-1)
 			}
 		}
 		sh.mu.Unlock()
@@ -200,3 +220,40 @@ func (m *Manager) sweep(offset, n int) {
 
 func (m *Manager) Count() int      { return int(m.count.Load()) }
 func (m *Manager) Rejected() int64 { return m.rejected.Load() }
+
+// SetMax applies a new session cap live. max <= 0 means unlimited.
+func (m *Manager) SetMax(max int64) { m.max.Store(max) }
+func (m *Manager) Created() int64   { return m.created.Load() }
+func (m *Manager) Expired() int64   { return m.expired.Load() }
+
+func (m *Manager) bcount(listener, backend string) *atomic.Int64 {
+	k := listener + "|" + backend
+	if v, ok := m.bcounts.Load(k); ok {
+		return v.(*atomic.Int64)
+	}
+	v, _ := m.bcounts.LoadOrStore(k, &atomic.Int64{})
+	return v.(*atomic.Int64)
+}
+
+// BackendCount returns the live session count for one listener+backend.
+func (m *Manager) BackendCount(listener, backend string) int64 {
+	return m.bcount(listener, backend).Load()
+}
+
+// BackendCounts returns live session counts per backend for one listener.
+func (m *Manager) BackendCounts(listener string) map[string]int64 {
+	out := make(map[string]int64)
+	m.bcounts.Range(func(k, v any) bool {
+		key := k.(string)
+		if strings.HasPrefix(key, listener+"|") {
+			out[strings.TrimPrefix(key, listener+"|")] = v.(*atomic.Int64).Load()
+		}
+		return true
+	})
+	return out
+}
+
+// CloseListener closes every session of one listener (reload removal path).
+func (m *Manager) CloseListener(listener string) int {
+	return m.closeWhere(func(s *Session) bool { return s.Listener == listener })
+}
