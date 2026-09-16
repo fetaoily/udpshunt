@@ -70,7 +70,7 @@ func startRecordingEcho(t *testing.T) (addr string, sources func() int) {
 func newStack(t *testing.T, lc config.Listener, maxSessions int64) (*Listener, *balancer.Balancer, *session.Manager) {
 	t.Helper()
 	mgr := session.NewManager(maxSessions)
-	bal := balancer.New(lc.Backends, 0)
+	bal := balancer.New(lc.Backends, balancer.Options{})
 	l, err := New(lc.Name, lc, bal, mgr, slog.Default())
 	if err != nil {
 		t.Fatal(err)

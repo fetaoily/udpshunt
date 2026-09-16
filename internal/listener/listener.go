@@ -136,7 +136,10 @@ func (l *Listener) handle(client *net.UDPAddr, pkt []byte) {
 // downstream relay goroutine. It returns nil when the session could not be
 // established or stored.
 func (l *Listener) createSession(client *net.UDPAddr) *session.Session {
-	backendAddr := l.bal.Pick()
+	backendAddr := l.bal.Pick(client.IP.String())
+	if backendAddr == "" {
+		return nil
+	}
 	raddr, ok := l.resolved[backendAddr]
 	if !ok {
 		// Should not happen (New pre-resolves every configured backend);

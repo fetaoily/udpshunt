@@ -141,7 +141,7 @@ func TestGracefulShutdown(t *testing.T) {
 	// independently of newStack's t.Cleanup.
 	backend := startEcho(t)
 	mgr := session.NewManager(0)
-	bal := balancer.New([]string{backend}, 0)
+	bal := balancer.New([]string{backend}, balancer.Options{})
 	lc := config.Listener{Name: "stop", Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
 	l, err := New(lc.Name, lc, bal, mgr, slog.Default())
 	if err != nil {

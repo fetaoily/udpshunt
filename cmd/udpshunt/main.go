@@ -79,8 +79,12 @@ func run() error {
 // buildListener wires one configured listener with its own balancer and the
 // shared session manager.
 func buildListener(lc config.Listener, mgr *session.Manager, logger *slog.Logger) (*listener.Listener, error) {
-	bal := balancer.New(lc.Backends, 0)
-	bal.SetOnDown(func(addr string) {
+	bal := balancer.New(lc.Backends, balancer.Options{})
+	bal.SetOnStateChange(func(addr string, healthy bool) {
+		if healthy {
+			logger.Info("backend marked up", "listener", lc.Name, "backend", addr)
+			return
+		}
 		n := mgr.CloseBackend(lc.Name, addr)
 		logger.Info("backend marked down, sessions closed", "listener", lc.Name, "backend", addr, "sessions", n)
 	})
