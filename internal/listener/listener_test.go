@@ -71,7 +71,7 @@ func newStack(t *testing.T, lc config.Listener, maxSessions int64) (*Listener, *
 	t.Helper()
 	mgr := session.NewManager(maxSessions)
 	bal := balancer.New(lc.Backends, balancer.Options{})
-	l, err := New(lc.Name, lc, bal, mgr, slog.Default())
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

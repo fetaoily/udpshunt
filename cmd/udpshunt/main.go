@@ -88,7 +88,7 @@ func buildListener(lc config.Listener, mgr *session.Manager, logger *slog.Logger
 		n := mgr.CloseBackend(lc.Name, addr)
 		logger.Info("backend marked down, sessions closed", "listener", lc.Name, "backend", addr, "sessions", n)
 	})
-	l, err := listener.New(lc.Name, lc, bal, mgr, logger)
+	l, err := listener.New(lc.Name, lc, bal, mgr, logger, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/fetaoily/udpshunt/internal/balancer"
 	"github.com/fetaoily/udpshunt/internal/config"
+	"github.com/fetaoily/udpshunt/internal/metrics"
 	"github.com/fetaoily/udpshunt/internal/session"
 )
 
@@ -143,7 +144,7 @@ func TestGracefulShutdown(t *testing.T) {
 	mgr := session.NewManager(0)
 	bal := balancer.New([]string{backend}, balancer.Options{})
 	lc := config.Listener{Name: "stop", Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
-	l, err := New(lc.Name, lc, bal, mgr, slog.Default())
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,5 +181,86 @@ func TestGracefulShutdown(t *testing.T) {
 	}
 	if err := l.Close(); err != nil {
 		t.Fatalf("second Close returned error (must be idempotent): %v", err)
+	}
+}
+
+func TestMetricsCountTraffic(t *testing.T) {
+	backend := startEcho(t)
+	lc := config.Listener{Name: "met", Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
+	met := metrics.New()
+	lm := met.ForListener("met")
+	mgr := session.NewManager(0)
+	bal := balancer.New(lc.Backends, balancer.Options{})
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), lm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Same LIFO teardown as newStack: cancel (stop receiving) -> CloseAll
+	// (unblock downstream readers) -> Close (release the frontend socket);
+	// without it goleak flags the session's downstream goroutine.
+	defer func() { _ = l.Close() }()
+	defer mgr.CloseAll()
+	defer cancel()
+	go func() { _ = l.Run(ctx) }()
+
+	client := testClient(t)
+	if got := roundTrip(t, client, l.Addr(), "x"); got != "echo:x" {
+		t.Fatalf("reply = %q", got)
+	}
+	fams, err := met.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	vals := map[string]float64{}
+	for _, f := range fams {
+		for _, mv := range f.GetMetric() {
+			vals[f.GetName()] = mv.GetCounter().GetValue()
+		}
+	}
+	if vals["udpshunt_packets_in_total"] < 1 {
+		t.Fatalf("packets_in = %v", vals)
+	}
+	if vals["udpshunt_backend_packets_out_total"] < 1 {
+		t.Fatalf("backend_packets_out = %v", vals)
+	}
+	if vals["udpshunt_sessions_created_total"] < 1 {
+		t.Fatalf("sessions_created = %v", vals)
+	}
+}
+
+func TestUpdateTimeoutAppliesToNewSessions(t *testing.T) {
+	backend := startEcho(t)
+	lc := config.Listener{Name: "tt", Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
+	mgr := session.NewManager(0)
+	bal := balancer.New(lc.Backends, balancer.Options{})
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Same LIFO teardown as newStack: cancel (stop receiving) -> CloseAll
+	// (unblock downstream readers) -> Close (release the frontend socket);
+	// without it goleak flags the session's downstream goroutine.
+	defer func() { _ = l.Close() }()
+	defer mgr.CloseAll()
+	defer cancel()
+	go func() { _ = l.Run(ctx) }()
+	l.UpdateTimeout(100 * time.Millisecond)
+
+	reapCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	mgr.Start(reapCtx, 20*time.Millisecond)
+
+	client := testClient(t)
+	if got := roundTrip(t, client, l.Addr(), "p"); got != "echo:p" {
+		t.Fatalf("reply = %q", got)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && mgr.Count() > 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if mgr.Count() != 0 {
+		t.Fatal("new timeout must apply to sessions created after UpdateTimeout")
 	}
 }
