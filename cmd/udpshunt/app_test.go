@@ -416,3 +416,46 @@ func TestStatusAndAdminEndpoints(t *testing.T) {
 		t.Fatalf("events must record listener_started and reload_failed, got %+v", app.events.List())
 	}
 }
+
+func TestReloadKeepsSurvivingBackendSessions(t *testing.T) {
+	b1 := startEcho(t)
+	b2 := startEcho(t)
+	b3 := startEcho(t)
+	p := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s, %s]\n", b1, b2), ""))
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	l1 := app.listeners["L1"].Addr()
+	if got, err := roundTripUDP(t, l1, "x"); err != nil || got != "echo:x" {
+		t.Fatalf("setup: %q %v", got, err)
+	}
+
+	app.mu.Lock()
+	counts := app.mgr.BackendCounts("L1")
+	app.mu.Unlock()
+	keeper, evictee := "", ""
+	for _, b := range []string{b1, b2} {
+		if counts[b] > 0 {
+			keeper = b
+		} else {
+			evictee = b
+		}
+	}
+	if keeper == "" {
+		t.Fatal("no session found on either backend")
+	}
+
+	p2 := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s, %s]\n", keeper, b3), ""))
+	if err := app.Apply(context.Background(), mustLoad(t, p2)); err != nil {
+		t.Fatal(err)
+	}
+	if n := app.mgr.BackendCount("L1", keeper); n != 1 {
+		t.Fatalf("surviving backend session was evicted, count = %d", n)
+	}
+	if n := app.mgr.BackendCount("L1", evictee); n != 0 {
+		t.Fatalf("evicted backend still holds sessions, count = %d", n)
+	}
+}

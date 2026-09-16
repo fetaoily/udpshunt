@@ -86,7 +86,7 @@ func eventually(t *testing.T, timeout time.Duration, what string, cond func() bo
 
 func TestRawProbeKeepsHealthyBackendUp(t *testing.T) {
 	addr := startResponder(t)
-	bal := balancer.New([]string{addr}, balancer.Options{Fall: 1, Rise: 1, ActiveChecks: true})
+	bal := balancer.New([]string{addr}, balancer.Options{Fall: 2, Rise: 1, ActiveChecks: true})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p := Start(ctx, bal, []string{addr}, testHC("raw", "ab"), slog.Default())

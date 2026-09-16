@@ -185,7 +185,9 @@ func (a *App) updateListenerLocked(lc config.Listener) {
 	}
 	bal.Update(lc.Backends)
 	for _, addr := range departing {
-		a.mgr.CloseBackend(lc.Name, addr)
+		if n := a.mgr.CloseBackend(lc.Name, addr); n > 0 {
+			a.events.Add("backend_evicted", fmt.Sprintf("%s %s closed=%d", lc.Name, addr, n))
+		}
 	}
 	// Re-seed the gauges for the new pool: new backends start healthy and
 	// survivors keep their state, so seed from the actual post-Update view.

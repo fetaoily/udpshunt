@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -177,7 +178,7 @@ listeners:
     bind: 127.0.0.1:19000
     backends: [127.0.0.1:19001]
 `
-	cases := map[string]string{
+	validateCases := map[string]string{
 		"bad balance":             base + "    balance: magic\n",
 		"bad hc mode":             base + "    health_check:\n      mode: tcp\n",
 		"raw no payload":          base + "    health_check:\n      mode: raw\n",
@@ -186,12 +187,50 @@ listeners:
 		"bad rise":                base + "    health_check:\n      mode: dns\n      rise: -1\n",
 		"bad admin bind":          base + "admin:\n  bind: nope\n",
 		"negative global timeout": base + "sessions:\n  timeout: -1s\n",
-		"unknown field":           base + "sessions:\n  mx: 1\n",
+	}
+	for name, yaml := range validateCases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, yaml))
+			if err == nil {
+				t.Fatalf("expected error for %s", name)
+			}
+			if !strings.HasPrefix(err.Error(), "invalid config: ") {
+				t.Fatalf("error for %s did not come from Validate: %v", name, err)
+			}
+		})
+	}
+	parseCases := map[string]string{
+		"unknown field": base + "sessions:\n  mx: 1\n",
+	}
+	for name, yaml := range parseCases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, yaml))
+			if err == nil {
+				t.Fatalf("expected error for %s", name)
+			}
+			if !strings.HasPrefix(err.Error(), "parse config: ") {
+				t.Fatalf("error for %s did not come from YAML parsing: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestM3ValidationErrors(t *testing.T) {
+	listener := func(name, backends string) string {
+		return "listeners:\n  - name: " + name + "\n    bind: 127.0.0.1:19000\n    backends: [" + backends + "]\n"
+	}
+	cases := map[string]string{
+		"duplicate backends": listener("a", "127.0.0.1:19001, 127.0.0.1:19001"),
+		"name with pipe":     listener(`"a|b"`, "127.0.0.1:19001"),
 	}
 	for name, yaml := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := Load(writeConfig(t, yaml)); err == nil {
+			_, err := Load(writeConfig(t, yaml))
+			if err == nil {
 				t.Fatalf("expected error for %s", name)
+			}
+			if !strings.HasPrefix(err.Error(), "invalid config: ") {
+				t.Fatalf("error for %s did not come from Validate: %v", name, err)
 			}
 		})
 	}

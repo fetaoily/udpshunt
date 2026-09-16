@@ -1,8 +1,11 @@
 package admin
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -102,5 +105,48 @@ func TestRecorderBoundsAndOrder(t *testing.T) {
 	}
 	if all[0].Detail != "2" || all[2].Detail != "4" {
 		t.Fatalf("kept newest 3 in order, got %v", all)
+	}
+}
+
+func TestRunGracefulStop(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	s := New(fmt.Sprintf("127.0.0.1:%d", port), Deps{
+		Registry: prometheus.NewRegistry(),
+		Status:   func() Status { return Status{} },
+		Reload:   func() error { return nil },
+		Logger:   slog.Default(),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	up := false
+	for time.Now().Before(deadline) && !up {
+		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/status", port))
+		if err == nil {
+			resp.Body.Close()
+			up = true
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if !up {
+		t.Fatal("server did not come up within 2s")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel")
 	}
 }

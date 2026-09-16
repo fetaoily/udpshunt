@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -131,6 +132,11 @@ func (c Config) Validate() error {
 		if l.Name == "" {
 			return fmt.Errorf("listeners[%d]: name is required", i)
 		}
+		if strings.Contains(l.Name, "|") {
+			// "|" is the session-key and backend-count map separator; a name
+			// containing it could collide with another listener's keys.
+			return fmt.Errorf("listeners[%d] (%s): name must not contain %q", i, l.Name, "|")
+		}
 		if seen[l.Name] {
 			return fmt.Errorf("listeners[%d] (%s): duplicate name", i, l.Name)
 		}
@@ -141,10 +147,15 @@ func (c Config) Validate() error {
 		if len(l.Backends) == 0 {
 			return fmt.Errorf("listeners[%d] (%s): at least one backend is required", i, l.Name)
 		}
+		seenBackends := make(map[string]bool, len(l.Backends))
 		for _, b := range l.Backends {
 			if _, err := net.ResolveUDPAddr("udp", b); err != nil {
 				return fmt.Errorf("listeners[%d] (%s): invalid backend %q: %w", i, l.Name, b, err)
 			}
+			if seenBackends[b] {
+				return fmt.Errorf("listeners[%d] (%s): duplicate backend %q", i, l.Name, b)
+			}
+			seenBackends[b] = true
 		}
 		switch l.Balance {
 		case "round_robin", "least_sessions", "source_hash":
