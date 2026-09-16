@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 
 	"github.com/fetaoily/udpshunt/internal/admin"
 	"github.com/fetaoily/udpshunt/internal/config"
+	"github.com/fetaoily/udpshunt/internal/webui"
 )
 
 func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
@@ -391,12 +394,7 @@ func TestStatusAndAdminEndpoints(t *testing.T) {
 	// draft left cfgPath pointing at the valid config (which reloads 204),
 	// so point it at a broken one first.
 	app.cfgPath = writeCfg(t, "listeners: [broken\n")
-	ts := httptest.NewServer(admin.New("127.0.0.1:0", admin.Deps{
-		Registry: app.met.Registry(),
-		Status:   app.Status,
-		Reload:   app.Reload,
-		Logger:   slog.Default(),
-	}).Handler())
+	ts := httptest.NewServer(adminHandlerForTest(app))
 	defer ts.Close()
 	resp, err := http.Get(ts.URL + "/metrics")
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -489,5 +487,65 @@ func TestStatusCarriesRateHistory(t *testing.T) {
 	}
 	if hist[1].In < hist[0].In || hist[1].In == 0 {
 		t.Fatalf("cumulative packets_in must grow: %+v", hist)
+	}
+}
+
+// adminHandlerForTest builds the admin mux wired to an app's live state the
+// way run() wires it in production, the embedded /ui included.
+func adminHandlerForTest(app *App) http.Handler {
+	return admin.New("127.0.0.1:0", admin.Deps{
+		Registry: app.met.Registry(),
+		Status:   app.Status,
+		Reload:   app.Reload,
+		Logger:   slog.Default(),
+		UI:       webui.Handler(),
+	}).Handler()
+}
+
+func TestSamplerPopulatesHistoryOverTime(t *testing.T) {
+	b1 := startEcho(t)
+	p := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1), ""))
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	// Drive the collector the way run()'s sampler does, but fast.
+	for i := 0; i < 3; i++ {
+		if got, err := roundTripUDP(t, app.listeners["L1"].Addr(), "s"); err != nil || got != "echo:s" {
+			t.Fatalf("traffic %d: %q %v", i, got, err)
+		}
+		app.rates.Tick(time.Now())
+		time.Sleep(5 * time.Millisecond)
+	}
+	st := app.Status()
+	for _, l := range st.Listeners {
+		if l.Name == "L1" && len(l.History) >= 2 {
+			return
+		}
+	}
+	t.Fatal("expected L1 history with >= 2 samples")
+}
+
+func TestUIServesBuiltSPA(t *testing.T) {
+	b1 := startEcho(t)
+	p := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1), ""))
+	app, _ := newApp(t, p)
+	_ = app.Apply(context.Background(), mustLoad(t, p))
+
+	ts := httptest.NewServer(adminHandlerForTest(app))
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/ui/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/ui/ = %d", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), "<div id=\"app\">") {
+		t.Fatalf("/ui/ does not serve the SPA shell: %.200s", body)
 	}
 }

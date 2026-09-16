@@ -2,7 +2,7 @@
 
 A high-performance UDP layer-4 load balancer and port forwarder written in Go.
 
-Status: M2 (active health checks, admin API, metrics, hot reload). Design: `docs/superpowers/specs/2026-09-15-udpshunt-design.md`
+Status: M4 (monitoring frontends: `udpshunt tui`, the embedded web UI at `/ui`, per-listener rate history). Design: `docs/superpowers/specs/2026-09-15-udpshunt-design.md`
 
 ## Build
 
@@ -91,6 +91,11 @@ The admin API also serves a single-page dashboard at `/ui` on the same port
 polls `/status` every 2s). The built asset is committed in
 `internal/webui/dist` and embedded into the binary via `go:embed` — no extra
 files are needed at runtime.
+
+There is no built-in authentication on the admin port (design assumption C):
+`/ui`, `/status` and `/metrics` are open to anyone who can reach it. Keep
+`admin.bind` on loopback (the default `127.0.0.1:9155`) or put the port
+behind an authenticating proxy before exposing it.
 
 To rebuild it after changing `web/src`, run from the repo root (requires
 node >= 20 and npm):
