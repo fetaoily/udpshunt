@@ -33,6 +33,10 @@ type App struct {
 	probes    map[string]*health.Prober
 	cancels   map[string]context.CancelFunc
 	runDone   map[string]chan struct{}
+	// lctxs holds each listener's derived ctx: probes must die with their
+	// listener, so they take this ctx — never the Apply ctx (Background
+	// under Reload), which nothing cancels.
+	lctxs map[string]context.Context
 }
 
 func NewApp(cfgPath string, logger *slog.Logger) *App {
@@ -48,6 +52,7 @@ func NewApp(cfgPath string, logger *slog.Logger) *App {
 		probes:    map[string]*health.Prober{},
 		cancels:   map[string]context.CancelFunc{},
 		runDone:   map[string]chan struct{}{},
+		lctxs:     map[string]context.Context{},
 	}
 }
 
@@ -67,7 +72,7 @@ func (a *App) Apply(ctx context.Context, cfg config.Config) error {
 	for _, lc := range cfg.Listeners {
 		oldBind := boundOf(a.cfg, lc.Name)
 		if _, exists := a.listeners[lc.Name]; exists && oldBind == lc.Bind {
-			a.updateListenerLocked(ctx, lc)
+			a.updateListenerLocked(lc)
 			continue
 		}
 		if _, exists := a.listeners[lc.Name]; exists {
@@ -127,6 +132,7 @@ func (a *App) startListenerLocked(ctx context.Context, lc config.Listener) error
 	a.balancers[lc.Name] = bal
 	a.cancels[lc.Name] = cancel
 	a.runDone[lc.Name] = done
+	a.lctxs[lc.Name] = lctx
 	go func() {
 		defer close(done)
 		if err := l.Run(lctx); err != nil {
@@ -149,13 +155,13 @@ func (a *App) startProbeLocked(ctx context.Context, lc config.Listener) {
 	a.probes[lc.Name] = health.Start(ctx, a.balancers[lc.Name], lc.Backends, lc.HealthCheck, a.logger)
 }
 
-func (a *App) updateListenerLocked(ctx context.Context, lc config.Listener) {
+func (a *App) updateListenerLocked(lc config.Listener) {
 	bal := a.balancers[lc.Name]
 	bal.Update(lc.Backends)
 	bal.SetBalance(lc.Balance)
 	bal.SetHealth(healthEnabled(lc.HealthCheck), lc.HealthCheck.Rise, lc.HealthCheck.Fall)
 	a.listeners[lc.Name].UpdateTimeout(time.Duration(lc.SessionTimeout))
-	a.startProbeLocked(ctx, lc)
+	a.startProbeLocked(a.lctxs[lc.Name], lc)
 	a.events.Add("listener_updated", lc.Name)
 }
 
@@ -185,6 +191,7 @@ func (a *App) stopListenerLocked(name string) {
 	delete(a.balancers, name)
 	delete(a.cancels, name)
 	delete(a.runDone, name)
+	delete(a.lctxs, name)
 }
 
 // Reload loads the config file and applies it. On failure the previous
@@ -227,6 +234,12 @@ func (a *App) Status() admin.Status {
 	}
 	for _, lc := range a.cfg.Listeners {
 		bal := a.balancers[lc.Name]
+		if bal == nil {
+			// A failed reload can stop a listener without updating a.cfg;
+			// it is genuinely down, so do not list it (and never Snapshot
+			// a nil balancer).
+			continue
+		}
 		counts := a.mgr.BackendCounts(lc.Name)
 		var total int64
 		bs := make([]admin.BackendStatus, 0, len(counts))
