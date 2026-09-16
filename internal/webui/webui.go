@@ -25,9 +25,13 @@ func Handler() http.Handler {
 			// Serve index.html at the bare /ui/ path.
 			r.URL.Path = "/"
 		}
-		if _, err := fs.Stat(sub, p); err != nil {
+		if st, err := fs.Stat(sub, strings.TrimSuffix(p, "/")); err != nil {
 			// SPA fallback: unknown paths render the app shell.
 			r.URL.Path = "/"
+		} else if st.IsDir() {
+			// Directories have no meaning in the SPA layout; never list them.
+			http.NotFound(w, r)
+			return
 		}
 		fileServer.ServeHTTP(w, r)
 	})

@@ -318,6 +318,7 @@ func (a *App) runSampler(ctx context.Context) {
 			return
 		case ts := <-t.C:
 			a.rates.Tick(ts)
+			a.rates.Prune(ts, 10*time.Minute) // double the history window: a listener silent for 10 min is gone
 		}
 	}
 }

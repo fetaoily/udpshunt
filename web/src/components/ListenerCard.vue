@@ -29,7 +29,12 @@ function mount() {
     instance = echarts.init(chartRef.value)
   }
 }
-onMounted(mount)
+const onResize = () => instance?.resize()
+onMounted(() => {
+  mount()
+  if (props.listener) render()
+  window.addEventListener('resize', onResize)
+})
 
 function render() {
   mount()
@@ -44,7 +49,10 @@ function render() {
   }, true)
 }
 watch(() => props.listener, render)
-onBeforeUnmount(() => instance?.dispose())
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', onResize)
+  instance?.dispose()
+})
 </script>
 
 <style scoped>

@@ -3,7 +3,7 @@
     <h2>Events</h2>
     <table>
       <tbody>
-        <tr v-for="(e, i) in events" :key="i">
+        <tr v-for="e in events" :key="e.time + e.kind">
           <td class="time">{{ time(e.time) }}</td>
           <td class="kind">{{ e.kind }}</td>
           <td>{{ e.detail }}</td>

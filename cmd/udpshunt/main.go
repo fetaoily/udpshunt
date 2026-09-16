@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -88,6 +89,9 @@ func runTUI(args []string) error {
 	addr := fs.String("addr", "http://127.0.0.1:9155", "admin API base URL")
 	interval := fs.Duration("interval", time.Second, "poll interval")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil // usage already printed; --help is not an error
+		}
 		return err
 	}
 	return tui.Run(*addr, *interval)

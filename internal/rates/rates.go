@@ -26,8 +26,9 @@ type Sample struct {
 
 // Ring is a fixed-capacity FIFO of samples.
 type Ring struct {
-	cap int
-	all []Sample
+	cap      int
+	all      []Sample
+	lastSeen int64 // unix millis of the most recent snapshot containing this listener
 }
 
 func (r *Ring) Push(s Sample) {
@@ -78,8 +79,28 @@ func (c *Collector) Tick(now time.Time) {
 	s := Sample{T: now.UnixMilli()}
 	for name, r := range snap {
 		s.Rates = r
-		c.ringFor(name).Push(s)
+		ring := c.ringFor(name)
+		ring.lastSeen = now.UnixMilli()
+		ring.Push(s)
 	}
+}
+
+// Prune drops rings whose listener has not appeared in a source snapshot
+// for longer than olderThan (spec §9: frontends only render configured
+// listeners; stopped listeners must not accumulate forever). Returns the
+// number of rings removed.
+func (c *Collector) Prune(now time.Time, olderThan time.Duration) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cutoff := now.Add(-olderThan).UnixMilli()
+	removed := 0
+	for name, r := range c.rings {
+		if r.lastSeen < cutoff {
+			delete(c.rings, name)
+			removed++
+		}
+	}
+	return removed
 }
 
 // History returns a copy of one listener's ring (oldest first).

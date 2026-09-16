@@ -13,7 +13,7 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import { humanBytes, perSecond, rateSeries } from '../lib/api.js'
 
@@ -62,8 +62,16 @@ function render() {
   }, true)
 }
 
+const onResize = () => instance?.resize()
+onMounted(() => {
+  if (props.status) render()
+  window.addEventListener('resize', onResize)
+})
 watch(() => props.status, render)
-onBeforeUnmount(() => instance?.dispose())
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', onResize)
+  instance?.dispose()
+})
 </script>
 
 <style scoped>

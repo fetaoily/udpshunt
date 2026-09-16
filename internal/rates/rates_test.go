@@ -62,6 +62,36 @@ type errBoom struct{}
 
 func (errBoom) Error() string { return "boom" }
 
+func TestPruneDropsStaleRings(t *testing.T) {
+	seq := []map[string]Rates{
+		{"L1": {In: 1}, "L2": {In: 2}},
+		{"L2": {In: 3}},
+	}
+	i := 0
+	c := NewCollector(10, func() (map[string]Rates, error) { s := seq[i]; i++; return s, nil })
+	base := time.Unix(1700000000, 0)
+	c.Tick(base)
+	c.Tick(base.Add(time.Second))
+	if n := c.Prune(base.Add(time.Second).Add(10*time.Minute), 10*time.Minute); n != 1 {
+		t.Fatalf("pruned %d, want 1 (L1 silent for 10 min)", n)
+	}
+	if c.History("L1") != nil {
+		t.Fatal("L1 ring should be gone")
+	}
+	if got := c.History("L2"); len(got) != 2 {
+		t.Fatalf("L2 must survive: %+v", got)
+	}
+}
+
+func TestPruneKeepsFreshRings(t *testing.T) {
+	c := NewCollector(10, func() (map[string]Rates, error) { return map[string]Rates{"L1": {In: 1}}, nil })
+	base := time.Unix(1700000000, 0)
+	c.Tick(base)
+	if n := c.Prune(base.Add(time.Second), 10*time.Minute); n != 0 {
+		t.Fatalf("fresh ring pruned: %d", n)
+	}
+}
+
 func TestFromRegistrySumsListenerLabels(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	factory := promauto.With(reg)
