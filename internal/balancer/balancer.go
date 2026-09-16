@@ -222,8 +222,11 @@ func (b *Balancer) usable(be *backend, o *Options) (usable, recovered bool) {
 		return false, false // recovery only via ReportSuccess rise path
 	}
 	if time.Since(time.Unix(0, be.downSince.Load())) >= o.Cooldown {
+		// errCount is zeroed before the flip so an observer of the
+		// flipped-up state never sees the stale >= Fall streak; a CAS
+		// loser's zeroing is inert.
+		be.errCount.Store(0)
 		if be.healthy.CompareAndSwap(false, true) {
-			be.errCount.Store(0)
 			return true, true
 		}
 		return false, false
@@ -281,12 +284,17 @@ func (b *Balancer) ReportError(addr string) {
 	}
 	n := be.errCount.Add(1)
 	be.successCount.Store(0)
-	if be.healthy.Load() && n >= int64(o.Fall) && be.healthy.CompareAndSwap(true, false) {
+	if be.healthy.Load() && n >= int64(o.Fall) {
+		// Metadata lands before the flip: an observer of the flipped-down
+		// state must never see a stale (cooldown-elapsed) stamp. A CAS
+		// loser's write is inert — stamps are only read while down.
 		be.downSince.Store(time.Now().UnixNano())
-		// Fired after the state flip so ordering between the down and a
-		// following up transition is deterministic; never called under a
-		// lock. The CAS winner fires, so a transition fires exactly once.
-		b.fire(b.onStateFn(), addr, false)
+		if be.healthy.CompareAndSwap(true, false) {
+			// Fired after the state flip so ordering between the down and a
+			// following up transition is deterministic; never called under a
+			// lock. The CAS winner fires, so a transition fires exactly once.
+			b.fire(b.onStateFn(), addr, false)
+		}
 	}
 }
 
@@ -309,10 +317,17 @@ func (b *Balancer) ReportSuccess(addr string) {
 	if !o.ActiveChecks {
 		return
 	}
-	if be.successCount.Add(1) >= int64(o.Rise) && be.healthy.CompareAndSwap(false, true) {
+	if be.successCount.Add(1) >= int64(o.Rise) {
+		// Counters are zeroed before the flip: an observer of the
+		// flipped-up state must never see the stale >= Fall error streak,
+		// or a single concurrent error could re-down a fresh recovery. A
+		// CAS loser's zeroing is inert — the counters restart on the next
+		// down entry.
 		be.errCount.Store(0)
 		be.successCount.Store(0)
-		b.fire(b.onStateFn(), addr, true)
+		if be.healthy.CompareAndSwap(false, true) {
+			b.fire(b.onStateFn(), addr, true)
+		}
 	}
 }
 
