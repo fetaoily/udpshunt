@@ -110,3 +110,89 @@ func TestLoadMissingFile(t *testing.T) {
 		t.Fatal("expected error for missing file")
 	}
 }
+
+const m2Config = `
+listeners:
+  - name: dns-in
+    bind: 127.0.0.1:19000
+    backends: [127.0.0.1:19001]
+    balance: least_sessions
+    health_check:
+      mode: raw
+      payload: "0001020a"
+      interval: 2s
+      timeout: 500ms
+      rise: 2
+      fall: 3
+admin:
+  bind: 127.0.0.1:19155
+`
+
+func TestLoadM2Fields(t *testing.T) {
+	c, err := Load(writeConfig(t, m2Config))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hc := c.Listeners[0].HealthCheck
+	if hc.Mode != "raw" || hc.Payload != "0001020a" {
+		t.Fatalf("bad health check: %+v", hc)
+	}
+	if time.Duration(hc.Interval) != 2*time.Second || time.Duration(hc.Timeout) != 500*time.Millisecond {
+		t.Fatalf("bad durations: %+v", hc)
+	}
+	if hc.Rise != 2 || hc.Fall != 3 {
+		t.Fatalf("bad rise/fall: %+v", hc)
+	}
+	if c.Admin.Bind != "127.0.0.1:19155" {
+		t.Fatalf("bad admin bind: %q", c.Admin.Bind)
+	}
+}
+
+func TestHealthCheckDefaults(t *testing.T) {
+	c, err := Load(writeConfig(t, `
+listeners:
+  - name: a
+    bind: 127.0.0.1:19000
+    backends: [127.0.0.1:19001]
+    balance: source_hash
+    health_check:
+      mode: dns
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hc := c.Listeners[0].HealthCheck
+	if time.Duration(hc.Interval) != 5*time.Second || time.Duration(hc.Timeout) != 1*time.Second {
+		t.Fatalf("bad defaults: %+v", hc)
+	}
+	if hc.Rise != 2 || hc.Fall != 3 {
+		t.Fatalf("bad rise/fall defaults: %+v", hc)
+	}
+}
+
+func TestM2ValidationErrors(t *testing.T) {
+	base := `
+listeners:
+  - name: a
+    bind: 127.0.0.1:19000
+    backends: [127.0.0.1:19001]
+`
+	cases := map[string]string{
+		"bad balance":             base + "  balance: magic\n",
+		"bad hc mode":             base + "  health_check:\n    mode: tcp\n",
+		"raw no payload":          base + "  health_check:\n    mode: raw\n",
+		"raw bad payload":         base + "  health_check:\n    mode: raw\n    payload: zz\n",
+		"hc timeout >= interval":  base + "  health_check:\n    mode: dns\n    interval: 1s\n    timeout: 2s\n",
+		"bad rise":                base + "  health_check:\n    mode: dns\n    rise: 0\n",
+		"bad admin bind":          base + "admin:\n  bind: nope\n",
+		"negative global timeout": base + "sessions:\n  timeout: -1s\n",
+		"unknown field":           base + "sessions:\n  mx: 1\n",
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, yaml)); err == nil {
+				t.Fatalf("expected error for %s", name)
+			}
+		})
+	}
+}

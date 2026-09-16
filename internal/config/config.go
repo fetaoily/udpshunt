@@ -2,6 +2,8 @@
 package config
 
 import (
+	"bytes"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -30,14 +32,16 @@ type Config struct {
 	Listeners []Listener `yaml:"listeners"`
 	Sessions  Sessions   `yaml:"sessions"`
 	Logging   Logging    `yaml:"logging"`
+	Admin     Admin      `yaml:"admin"`
 }
 
 type Listener struct {
-	Name           string   `yaml:"name"`
-	Bind           string   `yaml:"bind"`
-	Backends       []string `yaml:"backends"`
-	Balance        string   `yaml:"balance"`
-	SessionTimeout Duration `yaml:"session_timeout"`
+	Name           string      `yaml:"name"`
+	Bind           string      `yaml:"bind"`
+	Backends       []string    `yaml:"backends"`
+	Balance        string      `yaml:"balance"`
+	SessionTimeout Duration    `yaml:"session_timeout"`
+	HealthCheck    HealthCheck `yaml:"health_check"`
 }
 
 type Sessions struct {
@@ -50,14 +54,29 @@ type Logging struct {
 	Format string `yaml:"format"`
 }
 
+type HealthCheck struct {
+	Mode     string   `yaml:"mode"` // none | raw | dns
+	Interval Duration `yaml:"interval"`
+	Timeout  Duration `yaml:"timeout"`
+	Rise     int      `yaml:"rise"`
+	Fall     int      `yaml:"fall"`
+	Payload  string   `yaml:"payload"` // hex bytes, raw mode only
+}
+
+type Admin struct {
+	Bind string `yaml:"bind"`
+}
+
 // Load reads the YAML file at path, applies defaults, and validates the result.
 func Load(path string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
 	var c Config
-	if err := yaml.Unmarshal(data, &c); err != nil {
+	if err := dec.Decode(&c); err != nil {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
 	applyDefaults(&c)
@@ -84,6 +103,22 @@ func applyDefaults(c *Config) {
 		if c.Listeners[i].SessionTimeout == 0 {
 			c.Listeners[i].SessionTimeout = c.Sessions.Timeout
 		}
+		hc := &c.Listeners[i].HealthCheck
+		if hc.Interval == 0 {
+			hc.Interval = Duration(5 * time.Second)
+		}
+		if hc.Timeout == 0 {
+			hc.Timeout = Duration(1 * time.Second)
+		}
+		if hc.Rise == 0 {
+			hc.Rise = 2
+		}
+		if hc.Fall == 0 {
+			hc.Fall = 3
+		}
+	}
+	if c.Admin.Bind == "" {
+		c.Admin.Bind = "127.0.0.1:9155"
 	}
 }
 
@@ -111,8 +146,34 @@ func (c Config) Validate() error {
 				return fmt.Errorf("listeners[%d] (%s): invalid backend %q: %w", i, l.Name, b, err)
 			}
 		}
-		if l.Balance != "round_robin" {
-			return fmt.Errorf("listeners[%d] (%s): unsupported balance %q (M1 supports round_robin)", i, l.Name, l.Balance)
+		switch l.Balance {
+		case "round_robin", "least_sessions", "source_hash":
+		default:
+			return fmt.Errorf("listeners[%d] (%s): unsupported balance %q", i, l.Name, l.Balance)
+		}
+		switch hc := l.HealthCheck; hc.Mode {
+		case "", "none":
+			// no checks
+		case "raw":
+			if _, err := hex.DecodeString(hc.Payload); err != nil {
+				return fmt.Errorf("listeners[%d] (%s): health_check payload must be hex: %w", i, l.Name, err)
+			}
+			if hc.Payload == "" {
+				return fmt.Errorf("listeners[%d] (%s): health_check mode raw requires payload", i, l.Name)
+			}
+		case "dns":
+			// built-in query payload
+		default:
+			return fmt.Errorf("listeners[%d] (%s): unsupported health_check mode %q", i, l.Name, hc.Mode)
+		}
+		if mode := l.HealthCheck.Mode; mode != "" && mode != "none" {
+			hc := l.HealthCheck
+			if hc.Interval <= 0 || hc.Timeout <= 0 || hc.Rise < 1 || hc.Fall < 1 {
+				return fmt.Errorf("listeners[%d] (%s): health_check interval/timeout must be positive and rise/fall >= 1", i, l.Name)
+			}
+			if hc.Timeout >= hc.Interval {
+				return fmt.Errorf("listeners[%d] (%s): health_check timeout must be shorter than interval", i, l.Name)
+			}
 		}
 		if l.SessionTimeout <= 0 {
 			return fmt.Errorf("listeners[%d] (%s): session_timeout must be positive", i, l.Name)
@@ -120,6 +181,12 @@ func (c Config) Validate() error {
 	}
 	if c.Sessions.Max < 0 {
 		return fmt.Errorf("sessions.max must be >= 0")
+	}
+	if c.Sessions.Timeout < 0 {
+		return fmt.Errorf("sessions.timeout must be >= 0")
+	}
+	if _, err := net.ResolveUDPAddr("udp", c.Admin.Bind); err != nil {
+		return fmt.Errorf("admin.bind: invalid address %q: %w", c.Admin.Bind, err)
 	}
 	switch c.Logging.Level {
 	case "debug", "info", "warn", "error":
