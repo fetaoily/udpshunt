@@ -84,6 +84,24 @@ API — the daemon itself must already be running:
 
 Press `q` or Ctrl-C to quit.
 
+## Web UI
+
+The admin API also serves a single-page dashboard at `/ui` on the same port
+(uptime and totals, per-listener rate charts, backend health, recent events;
+polls `/status` every 2s). The built asset is committed in
+`internal/webui/dist` and embedded into the binary via `go:embed` — no extra
+files are needed at runtime.
+
+To rebuild it after changing `web/src`, run from the repo root (requires
+node >= 20 and npm):
+
+    sh web/build.sh
+
+That runs `npm ci && npm run build` in `web/` and copies `dist/` into
+`internal/webui/dist`. For iteration with live reload, `npm run dev` in `web/`
+starts vite (dev-only proxy to `http://127.0.0.1:9155` for `/status` and
+`/metrics`).
+
 ## Hot reload
 
 Both `kill -HUP <pid>` (not delivered on Windows) and
