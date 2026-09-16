@@ -14,6 +14,7 @@ import (
 	"github.com/fetaoily/udpshunt/internal/admin"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/tui"
+	"github.com/fetaoily/udpshunt/internal/webui"
 )
 
 func main() {
@@ -52,6 +53,7 @@ func run() error {
 		Status:   app.Status,
 		Reload:   app.Reload,
 		Logger:   logger,
+		UI:       webui.Handler(),
 	})
 	go func() {
 		if err := adminSrv.Run(ctx); err != nil {

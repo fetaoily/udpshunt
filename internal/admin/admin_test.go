@@ -94,6 +94,44 @@ func TestReloadEndpointError(t *testing.T) {
 	}
 }
 
+func TestUIRoute(t *testing.T) {
+	s := New("127.0.0.1:0", Deps{
+		Registry: prometheus.NewRegistry(),
+		Status:   func() Status { return Status{} },
+		Reload:   func() error { return nil },
+		Logger:   slog.Default(),
+		UI: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte("<html><body>ui:" + r.URL.Path + "</body></html>"))
+		}),
+	})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/ui/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "ui:/") {
+		t.Fatalf("GET /ui/ = %d %q", resp.StatusCode, body)
+	}
+
+	// nil UI must 404
+	s2 := New("127.0.0.1:0", Deps{Registry: prometheus.NewRegistry(), Logger: slog.Default()})
+	ts2 := httptest.NewServer(s2.Handler())
+	defer ts2.Close()
+	resp3, err := http.Get(ts2.URL + "/ui/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusNotFound {
+		t.Fatalf("nil UI: GET /ui/ = %d, want 404", resp3.StatusCode)
+	}
+}
+
 func TestRecorderBoundsAndOrder(t *testing.T) {
 	r := NewRecorder(3)
 	for i := 0; i < 5; i++ {

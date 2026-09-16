@@ -98,6 +98,7 @@ type Deps struct {
 	Status   func() Status
 	Reload   func() error
 	Logger   *slog.Logger
+	UI       http.Handler
 }
 
 // Server is the admin HTTP endpoint.
@@ -112,6 +113,13 @@ func New(bind string, deps Deps) *Server {
 	mux.Handle("GET /metrics", promhttp.HandlerFor(deps.Registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("POST /reload", s.handleReload)
+	if deps.UI != nil {
+		ui := http.StripPrefix("/ui", deps.UI)
+		mux.Handle("GET /ui", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/ui/", http.StatusFound)
+		}))
+		mux.Handle("GET /ui/", ui)
+	}
 	s.srv = &http.Server{Addr: bind, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	return s
 }
