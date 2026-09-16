@@ -23,6 +23,9 @@ type batchReceiver interface {
 	// address and payload length of every packet. It honors the socket's
 	// read deadline.
 	ReceiveBatch(pc *net.UDPConn, bufs [][]byte, addrs []*net.UDPAddr, sizes []int) (n int, err error)
+
+	// MaxBatch reports how many packets one ReceiveBatch call accepts.
+	MaxBatch() int
 }
 
 // Wrap prepares pc for batched receiving.
@@ -34,6 +37,9 @@ func Wrap(pc *net.UDPConn) *Conn {
 func (c *Conn) ReceiveBatch(bufs [][]byte, addrs []*net.UDPAddr, sizes []int) (int, error) {
 	return c.batch.ReceiveBatch(c.pc, bufs, addrs, sizes)
 }
+
+// MaxBatch reports how many packets one ReceiveBatch call accepts.
+func (c *Conn) MaxBatch() int { return c.batch.MaxBatch() }
 
 // WriteToUDP sends one packet (delegation to the wrapped socket).
 func (c *Conn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {

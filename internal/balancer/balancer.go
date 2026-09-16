@@ -85,7 +85,9 @@ func New(addrs []string, opts Options) *Balancer {
 }
 
 // Update replaces the backend pool, preserving the state of backends that
-// stay; new backends start healthy with zeroed counters.
+// stay; new backends start healthy with zeroed counters. Concurrent calls
+// are last-writer-wins per call; production callers hold the supervisor
+// lock, making reloads single-writer.
 func (b *Balancer) Update(addrs []string) {
 	var prev map[string]*backend
 	if old := b.pool.Load(); old != nil {
@@ -111,7 +113,9 @@ func (b *Balancer) Update(addrs []string) {
 	b.pool.Store(&pool{list: list, byAddr: byAddr})
 }
 
-// SetBalance switches the algorithm live.
+// SetBalance switches the algorithm live. Concurrent calls are
+// last-writer-wins per call; production callers hold the supervisor lock,
+// making reloads single-writer.
 func (b *Balancer) SetBalance(mode string) {
 	o := *b.opts.Load()
 	o.Balance = mode
@@ -119,7 +123,9 @@ func (b *Balancer) SetBalance(mode string) {
 }
 
 // SetHealth adjusts the state machine thresholds live (reload path).
-// rise/fall <= 0 leave the current values unchanged.
+// rise/fall <= 0 leave the current values unchanged. Concurrent calls are
+// last-writer-wins per call; production callers hold the supervisor lock,
+// making reloads single-writer.
 func (b *Balancer) SetHealth(activeChecks bool, rise, fall int) {
 	o := *b.opts.Load()
 	o.ActiveChecks = activeChecks

@@ -246,8 +246,9 @@ func TestM3ValidationErrors(t *testing.T) {
 		return "listeners:\n  - name: " + name + "\n    bind: 127.0.0.1:19000\n    backends: [" + backends + "]\n"
 	}
 	cases := map[string]string{
-		"duplicate backends": listener("a", "127.0.0.1:19001, 127.0.0.1:19001"),
-		"name with pipe":     listener(`"a|b"`, "127.0.0.1:19001"),
+		"duplicate backends":         listener("a", "127.0.0.1:19001, 127.0.0.1:19001"),
+		"aliased duplicate backends": listener("a", `"127.0.0.1:19001", "localhost:19001"`),
+		"name with pipe":             listener(`"a|b"`, "127.0.0.1:19001"),
 	}
 	for name, yaml := range cases {
 		t.Run(name, func(t *testing.T) {

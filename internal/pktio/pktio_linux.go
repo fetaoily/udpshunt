@@ -41,6 +41,8 @@ func newBatchReceiver(pc *net.UDPConn) batchReceiver {
 	return r
 }
 
+func (r *linuxReceiver) MaxBatch() int { return maxBatchSize }
+
 func (r *linuxReceiver) ReceiveBatch(pc *net.UDPConn, bufs [][]byte, addrs []*net.UDPAddr, sizes []int) (int, error) {
 	if r.v4 != nil {
 		msgs := r.msgs4[:min(len(bufs), maxBatchSize)]

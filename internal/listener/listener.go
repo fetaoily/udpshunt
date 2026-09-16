@@ -101,8 +101,6 @@ func (l *Listener) UpdateTimeout(d time.Duration) {
 	l.mu.Unlock()
 }
 
-const recvBatchSize = 64
-
 // Run receives packets until ctx is cancelled. Cancellation stops the receive
 // loop without closing the socket: it must stay writable for the downstream
 // drain window; call Close once draining is done (spec §10).
@@ -113,13 +111,16 @@ func (l *Listener) Run(ctx context.Context) error {
 		// deadline instead of closing the socket.
 		_ = l.pc.SetReadDeadline(time.Now())
 	}()
-	raw := make([]byte, recvBatchSize*pktio.MaxPacketSize)
-	bufs := make([][]byte, recvBatchSize)
+	// Batch size comes from the platform receiver — 64 on Linux, 1 elsewhere
+	// — so non-Linux listeners stop allocating a 4 MiB arena they never use.
+	n := l.io.MaxBatch()
+	raw := make([]byte, n*pktio.MaxPacketSize)
+	bufs := make([][]byte, n)
 	for i := range bufs {
 		bufs[i] = raw[i*pktio.MaxPacketSize : (i+1)*pktio.MaxPacketSize]
 	}
-	addrs := make([]*net.UDPAddr, recvBatchSize)
-	sizes := make([]int, recvBatchSize)
+	addrs := make([]*net.UDPAddr, n)
+	sizes := make([]int, n)
 	for {
 		n, err := l.io.ReceiveBatch(bufs, addrs, sizes)
 		if ctx.Err() != nil {

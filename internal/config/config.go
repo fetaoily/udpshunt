@@ -148,15 +148,16 @@ func (c Config) Validate() error {
 		if len(l.Backends) == 0 {
 			return fmt.Errorf("listeners[%d] (%s): at least one backend is required", i, l.Name)
 		}
-		seenBackends := make(map[string]bool, len(l.Backends))
+		seenBackends := make(map[string]string, len(l.Backends)) // resolved -> raw
 		for _, b := range l.Backends {
-			if _, err := net.ResolveUDPAddr("udp", b); err != nil {
+			ra, err := net.ResolveUDPAddr("udp", b)
+			if err != nil {
 				return fmt.Errorf("listeners[%d] (%s): invalid backend %q: %w", i, l.Name, b, err)
 			}
-			if seenBackends[b] {
-				return fmt.Errorf("listeners[%d] (%s): duplicate backend %q", i, l.Name, b)
+			if prev, dup := seenBackends[ra.String()]; dup {
+				return fmt.Errorf("listeners[%d] (%s): duplicate backend %q (same address as %q)", i, l.Name, b, prev)
 			}
-			seenBackends[b] = true
+			seenBackends[ra.String()] = b
 		}
 		switch l.Balance {
 		case "round_robin", "least_sessions", "source_hash":

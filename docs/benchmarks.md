@@ -85,6 +85,9 @@ locally:
 | >= 3 Gbps throughput | not measured: the suite has no bulk-transfer benchmark and the dev box cannot spare >= 300 Mbit/s of loopback headroom for an honest run | pending |
 | >= 500k concurrent sessions | architectural bound is now memory per in-flight packet (one 64x64 KiB receive arena per listener + pooled relay buffers), not 64 KiB per live session; no dedicated soak in M3 | pending soak |
 
+Non-Linux platforms size the receive arena for a single-packet batch (the
+portable receiver), so the 4 MiB arena exists only on Linux.
+
 The absolute targets require a dedicated 4-core Linux VM (spec: certify by
 measurement on the real VM); dev-box and CI numbers are directional. Do not
 gate the milestone on them.
