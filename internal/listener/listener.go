@@ -19,6 +19,8 @@ import (
 
 const maxPacketSize = 65536
 
+const defaultReadBuffer = 4 << 20 // 4 MiB
+
 type Listener struct {
 	name     string
 	pc       *net.UDPConn
@@ -48,6 +50,13 @@ func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.
 	pc, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		return nil, err
+	}
+	readBuf := cfg.ReadBuffer
+	if readBuf <= 0 {
+		readBuf = defaultReadBuffer // spec §7: default above the OS baseline
+	}
+	if err := pc.SetReadBuffer(readBuf); err != nil {
+		logger.Warn("set read buffer failed", "listener", cfg.Name, "size", readBuf, "err", err)
 	}
 	resolved := make(map[string]*net.UDPAddr, len(cfg.Backends))
 	for _, b := range cfg.Backends {

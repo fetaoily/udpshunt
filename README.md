@@ -25,6 +25,23 @@ triggers a graceful drain.
 - `least_sessions` — backend with the fewest live sessions; ties keep the earliest backend in stable pool order.
 - `source_hash` — stable rendezvous hash of the client IP, so a client keeps its backend as long as it stays healthy; when no backend is healthy it fails open via the same rendezvous hash over all backends.
 
+## Listener socket buffer
+
+`read_buffer` sets the kernel receive buffer (`SO_RCVBUF`, in bytes) on the
+listener socket. `0` (the default) requests 4 MiB, comfortably above the OS
+baseline; negative values are rejected at config load:
+
+```yaml
+listeners:
+  - name: dns-in
+    bind: 0.0.0.0:53
+    backends: [10.0.0.1:53]
+    read_buffer: 8388608  # 8 MiB
+```
+
+The request is best-effort: if the kernel refuses (for example a low
+`net.core.rmem_max`), udpshunt logs a warning and keeps the socket.
+
 ## Health checks
 
 Optional `health_check` block per listener enables active probing:
@@ -72,6 +89,16 @@ Metric families: `udpshunt_packets_in_total`, `udpshunt_bytes_in_total`,
 `udpshunt_sessions_expired_total`, `udpshunt_sessions_rejected_total`,
 `udpshunt_sessions_active`; `udpshunt_reloads_total`,
 `udpshunt_reload_failures_total`, `udpshunt_uptime_seconds`.
+
+## Memory tuning
+
+When running many listeners or sessions, set `GOMEMLIMIT` to roughly 80% of
+the container or host memory budget so the Go GC targets that limit instead of
+growing until the kernel OOM-kills the process.
+
+Each listener holds ~4 MiB of kernel receive buffers by default (see
+`read_buffer` above), plus in-process packet batch buffers sized in upcoming
+work. Size `GOMEMLIMIT` with that baseline in mind.
 
 ## Development
 

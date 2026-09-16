@@ -43,6 +43,7 @@ type Listener struct {
 	Balance        string      `yaml:"balance"`
 	SessionTimeout Duration    `yaml:"session_timeout"`
 	HealthCheck    HealthCheck `yaml:"health_check"`
+	ReadBuffer     int         `yaml:"read_buffer"` // SO_RCVBUF bytes; 0 -> listener default
 }
 
 type Sessions struct {
@@ -188,6 +189,9 @@ func (c Config) Validate() error {
 		}
 		if l.SessionTimeout <= 0 {
 			return fmt.Errorf("listeners[%d] (%s): session_timeout must be positive", i, l.Name)
+		}
+		if l.ReadBuffer < 0 {
+			return fmt.Errorf("listeners[%d] (%s): read_buffer must be >= 0", i, l.Name)
 		}
 	}
 	if c.Sessions.Max < 0 {

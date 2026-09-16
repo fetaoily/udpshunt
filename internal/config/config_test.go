@@ -215,6 +215,32 @@ listeners:
 	}
 }
 
+func TestReadBufferConfig(t *testing.T) {
+	c, err := Load(writeConfig(t, `
+listeners:
+  - name: a
+    bind: 127.0.0.1:19000
+    backends: [127.0.0.1:19001]
+    read_buffer: 8388608
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Listeners[0].ReadBuffer != 8388608 {
+		t.Fatalf("read_buffer = %d", c.Listeners[0].ReadBuffer)
+	}
+	_, err = Load(writeConfig(t, `
+listeners:
+  - name: a
+    bind: 127.0.0.1:19000
+    backends: [127.0.0.1:19001]
+    read_buffer: -1
+`))
+	if err == nil {
+		t.Fatal("negative read_buffer must be rejected")
+	}
+}
+
 func TestM3ValidationErrors(t *testing.T) {
 	listener := func(name, backends string) string {
 		return "listeners:\n  - name: " + name + "\n    bind: 127.0.0.1:19000\n    backends: [" + backends + "]\n"
