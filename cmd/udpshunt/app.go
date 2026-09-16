@@ -13,6 +13,7 @@ import (
 	"github.com/fetaoily/udpshunt/internal/health"
 	"github.com/fetaoily/udpshunt/internal/listener"
 	"github.com/fetaoily/udpshunt/internal/metrics"
+	"github.com/fetaoily/udpshunt/internal/rates"
 	"github.com/fetaoily/udpshunt/internal/session"
 )
 
@@ -24,6 +25,7 @@ type App struct {
 	met     *metrics.Metrics
 	mgr     *session.Manager
 	events  *admin.Recorder
+	rates   *rates.Collector
 
 	mu        sync.Mutex
 	cfg       config.Config
@@ -44,13 +46,15 @@ type App struct {
 }
 
 func NewApp(cfgPath string, logger *slog.Logger) *App {
+	met := metrics.New()
 	return &App{
 		cfgPath:   cfgPath,
 		logger:    logger,
-		met:       metrics.New(),
+		met:       met,
 		mgr:       session.NewManager(0),
 		events:    admin.NewRecorder(100),
 		started:   time.Now(),
+		rates:     rates.NewCollector(300, rates.FromRegistry(met.Registry())),
 		listeners: map[string]*listener.Listener{},
 		balancers: map[string]*balancer.Balancer{},
 		binds:     map[string]string{},
@@ -293,11 +297,29 @@ func (a *App) Status() admin.Status {
 		if actual, ok := a.binds[lc.Name]; ok {
 			bind = actual
 		}
+		var hist []admin.Sample
+		for _, s := range a.rates.History(lc.Name) {
+			hist = append(hist, admin.Sample{T: s.T, In: s.In, Out: s.Out, BytesIn: s.BytesIn, BytesOut: s.BytesOut})
+		}
 		st.Listeners = append(st.Listeners, admin.ListenerStatus{
-			Name: lc.Name, Bind: bind, Balance: lc.Balance, Backends: bs, Sessions: total,
+			Name: lc.Name, Bind: bind, Balance: lc.Balance, Backends: bs, Sessions: total, History: hist,
 		})
 	}
 	return st
+}
+
+// runSampler feeds the rate rings once per second until ctx is cancelled.
+func (a *App) runSampler(ctx context.Context) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ts := <-t.C:
+			a.rates.Tick(ts)
+		}
+	}
 }
 
 // Shutdown stops everything: receive loops first, then a parallel drain

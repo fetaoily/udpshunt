@@ -67,6 +67,16 @@ type ListenerStatus struct {
 	Balance  string          `json:"balance"`
 	Backends []BackendStatus `json:"backends"`
 	Sessions int64           `json:"sessions"`
+	History  []Sample        `json:"history,omitempty"`
+}
+
+// Sample is one point of a listener's rate history (cumulative counters).
+type Sample struct {
+	T        int64  `json:"t"` // unix milliseconds
+	In       uint64 `json:"in"`
+	Out      uint64 `json:"out"`
+	BytesIn  uint64 `json:"bytes_in"`
+	BytesOut uint64 `json:"bytes_out"`
 }
 
 type BackendStatus struct {

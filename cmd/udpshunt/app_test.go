@@ -459,3 +459,35 @@ func TestReloadKeepsSurvivingBackendSessions(t *testing.T) {
 		t.Fatalf("evicted backend still holds sessions, count = %d", n)
 	}
 }
+
+func TestStatusCarriesRateHistory(t *testing.T) {
+	b1 := startEcho(t)
+	p := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1), ""))
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := roundTripUDP(t, app.listeners["L1"].Addr(), "h"); err != nil || got != "echo:h" {
+		t.Fatalf("setup: %q %v", got, err)
+	}
+	// Two manual ticks: the sampler is driven by run() in production, so
+	// tests drive the collector directly.
+	app.rates.Tick(time.Now())
+	time.Sleep(10 * time.Millisecond)
+	app.rates.Tick(time.Now())
+
+	st := app.Status()
+	var hist []admin.Sample
+	for _, l := range st.Listeners {
+		if l.Name == "L1" {
+			hist = l.History
+		}
+	}
+	if len(hist) != 2 {
+		t.Fatalf("history len = %d, want 2", len(hist))
+	}
+	if hist[1].In < hist[0].In || hist[1].In == 0 {
+		t.Fatalf("cumulative packets_in must grow: %+v", hist)
+	}
+}

@@ -41,6 +41,7 @@ func run() error {
 		func() int64 { return int64(app.mgr.Count()) })
 	app.mgr.SetMax(int64(cfg.Sessions.Max))
 	app.mgr.Start(ctx, time.Second) // spec §3: sweep 1/8 of shards per second
+	go app.runSampler(ctx)          // spec §8: rate history, one sample per second
 
 	adminSrv := admin.New(cfg.Admin.Bind, admin.Deps{
 		Registry: app.met.Registry(),
