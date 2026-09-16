@@ -232,6 +232,42 @@ func TestPassiveCooldownRecoveryFiresOnState(t *testing.T) {
 	}
 }
 
+func TestConcurrentReportsKeepConsistentState(t *testing.T) {
+	b := New([]string{"a:1", "b:1"}, Options{Fall: 3, Rise: 2, ActiveChecks: true, Cooldown: time.Hour})
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				addr := "a:1"
+				if i%2 == g%2 {
+					addr = "b:1"
+				}
+				if i%3 == 0 {
+					b.ReportSuccess(addr)
+				} else {
+					b.ReportError(addr)
+				}
+				if i%50 == 0 {
+					_ = b.Pick("")
+					_ = b.Snapshot()
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	for _, st := range b.Snapshot() {
+		if st.Addr != "a:1" && st.Addr != "b:1" {
+			t.Fatalf("unexpected backend %q", st.Addr)
+		}
+	}
+	// Whatever the interleaving, a Pick must still return a backend (fail-open).
+	if got := b.Pick(""); got != "a:1" && got != "b:1" {
+		t.Fatalf("Pick returned %q", got)
+	}
+}
+
 func TestOnStateChangeBothDirections(t *testing.T) {
 	b := New([]string{"a:1"}, Options{Fall: 1, Rise: 1, ActiveChecks: true})
 	var mu sync.Mutex

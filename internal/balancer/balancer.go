@@ -1,8 +1,11 @@
 // Package balancer picks a backend for new sessions and tracks health state.
+// The reporting path (ReportError/ReportSuccess) and Pick/Snapshot are
+// lock-free: per-backend counters and state are atomics, the pool and
+// options are copy-on-write atomic pointers (spec §7: no hot-path locks).
 package balancer
 
 import (
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,8 +25,7 @@ type Options struct {
 	Cooldown     time.Duration // passive recovery cooldown (default 10s)
 	ActiveChecks bool          // true: recovery needs Rise successes (no cooldown path)
 	// Counts reports the live session count per backend (least_sessions
-	// only). It is called under the balancer lock and must not re-enter
-	// the Balancer.
+	// only). It is called during Pick and must not re-enter the Balancer.
 	Counts func(addr string) int64
 }
 
@@ -35,19 +37,31 @@ type BackendState struct {
 
 type backend struct {
 	addr         string
-	healthy      bool
-	errCount     int
-	successCount int
-	downSince    time.Time
+	healthy      atomic.Bool
+	errCount     atomic.Int64
+	successCount atomic.Int64
+	downSince    atomic.Int64 // unix nanoseconds
+}
+
+type pool struct {
+	list   []*backend
+	byAddr map[string]*backend
 }
 
 type Balancer struct {
-	mu       sync.Mutex
-	backends []*backend
-	next     uint64
-	opts     Options
-	onState  func(addr string, healthy bool)
+	pool    atomic.Pointer[pool]
+	opts    atomic.Pointer[Options]
+	next    atomic.Uint64
+	onState atomic.Pointer[func(addr string, healthy bool)]
 }
+
+func (b *Balancer) fire(fn *func(addr string, healthy bool), addr string, healthy bool) {
+	if fn != nil && *fn != nil {
+		(*fn)(addr, healthy)
+	}
+}
+
+func (b *Balancer) onStateFn() *func(addr string, healthy bool) { return b.onState.Load() }
 
 // New creates a balancer over addrs.
 func New(addrs []string, opts Options) *Balancer {
@@ -63,7 +77,9 @@ func New(addrs []string, opts Options) *Balancer {
 	if opts.Balance == "" {
 		opts.Balance = "round_robin"
 	}
-	b := &Balancer{opts: opts}
+	b := &Balancer{}
+	o := opts
+	b.opts.Store(&o)
 	b.Update(addrs)
 	return b
 }
@@ -71,95 +87,94 @@ func New(addrs []string, opts Options) *Balancer {
 // Update replaces the backend pool, preserving the state of backends that
 // stay; new backends start healthy with zeroed counters.
 func (b *Balancer) Update(addrs []string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	old := make(map[string]*backend, len(b.backends))
-	for _, be := range b.backends {
-		old[be.addr] = be
-	}
-	next := make([]*backend, 0, len(addrs))
-	for _, a := range addrs {
-		if be, ok := old[a]; ok {
-			next = append(next, be)
-		} else {
-			next = append(next, &backend{addr: a, healthy: true})
+	var prev map[string]*backend
+	if old := b.pool.Load(); old != nil {
+		prev = make(map[string]*backend, len(old.list))
+		for _, be := range old.list {
+			prev[be.addr] = be
 		}
 	}
-	b.backends = next
+	list := make([]*backend, 0, len(addrs))
+	for _, a := range addrs {
+		if be, ok := prev[a]; ok {
+			list = append(list, be)
+		} else {
+			be := &backend{addr: a}
+			be.healthy.Store(true)
+			list = append(list, be)
+		}
+	}
+	byAddr := make(map[string]*backend, len(list))
+	for _, be := range list {
+		byAddr[be.addr] = be
+	}
+	b.pool.Store(&pool{list: list, byAddr: byAddr})
 }
 
 // SetBalance switches the algorithm live.
 func (b *Balancer) SetBalance(mode string) {
-	b.mu.Lock()
-	b.opts.Balance = mode
-	b.mu.Unlock()
+	o := *b.opts.Load()
+	o.Balance = mode
+	b.opts.Store(&o)
 }
 
 // SetHealth adjusts the state machine thresholds live (reload path).
 // rise/fall <= 0 leave the current values unchanged.
 func (b *Balancer) SetHealth(activeChecks bool, rise, fall int) {
-	b.mu.Lock()
-	b.opts.ActiveChecks = activeChecks
+	o := *b.opts.Load()
+	o.ActiveChecks = activeChecks
 	if rise > 0 {
-		b.opts.Rise = rise
+		o.Rise = rise
 	}
 	if fall > 0 {
-		b.opts.Fall = fall
+		o.Fall = fall
 	}
-	b.mu.Unlock()
+	b.opts.Store(&o)
 }
 
 // SetOnStateChange registers a callback fired on every UP<->DOWN transition.
-// The callback runs outside the balancer mutex, in transition order.
+// The callback runs outside any lock, exactly once per transition.
 func (b *Balancer) SetOnStateChange(fn func(addr string, healthy bool)) {
-	b.mu.Lock()
-	b.onState = fn
-	b.mu.Unlock()
+	b.onState.Store(&fn)
 }
 
 // Pick returns a healthy backend for a new session from clientIP (used only
 // by source_hash). It fails open when every backend is down (spec
 // assumption B) and returns "" for an empty pool.
 func (b *Balancer) Pick(clientIP string) string {
-	b.mu.Lock()
-	var recovered []string
-	if len(b.backends) == 0 {
-		b.mu.Unlock()
+	p := b.pool.Load()
+	if p == nil || len(p.list) == 0 {
 		return ""
 	}
-	addr, ok := b.pickHealthyLocked(clientIP, &recovered)
+	o := b.opts.Load()
+	var recovered []string
+	addr, ok := b.pick(clientIP, p, o, true, &recovered)
 	if !ok {
 		// fail-open: same algorithm ignoring health
-		addr, _ = b.pickLocked(clientIP, false, &recovered)
+		addr, _ = b.pick(clientIP, p, o, false, &recovered)
 	}
-	fn := b.onState
-	b.mu.Unlock()
-	b.fireRecovered(fn, recovered)
+	b.fireRecovered(b.onStateFn(), recovered)
 	return addr
 }
 
-func (b *Balancer) pickHealthyLocked(clientIP string, recovered *[]string) (string, bool) {
-	return b.pickLocked(clientIP, true, recovered)
-}
-
-func (b *Balancer) pickLocked(clientIP string, needHealthy bool, recovered *[]string) (string, bool) {
-	n := uint64(len(b.backends))
-	switch b.opts.Balance {
+func (b *Balancer) pick(clientIP string, p *pool, o *Options, needHealthy bool, recovered *[]string) (string, bool) {
+	n := uint64(len(p.list))
+	switch o.Balance {
 	case "least_sessions":
-		if b.opts.Counts != nil {
+		if o.Counts != nil {
 			best := -1
 			var bestCount int64
-			for i, be := range b.backends {
-				if needHealthy && !b.usableTrackLocked(be, recovered) {
+			for i, be := range p.list {
+				if needHealthy && !b.usableTrack(be, o, recovered) {
 					continue
 				}
-				c := b.opts.Counts(be.addr)
+				c := o.Counts(be.addr)
 				if best == -1 || c < bestCount {
 					best, bestCount = i, c
 				}
 			}
 			if best >= 0 {
-				return b.backends[best].addr, true
+				return p.list[best].addr, true
 			}
 			return "", false
 		}
@@ -168,8 +183,8 @@ func (b *Balancer) pickLocked(clientIP string, needHealthy bool, recovered *[]st
 		if clientIP != "" {
 			best := -1
 			var bestHash uint64
-			for i, be := range b.backends {
-				if needHealthy && !b.usableTrackLocked(be, recovered) {
+			for i, be := range p.list {
+				if needHealthy && !b.usableTrack(be, o, recovered) {
 					continue
 				}
 				h := rendezvous(clientIP, be.addr)
@@ -178,61 +193,59 @@ func (b *Balancer) pickLocked(clientIP string, needHealthy bool, recovered *[]st
 				}
 			}
 			if best >= 0 {
-				return b.backends[best].addr, true
+				return p.list[best].addr, true
 			}
 			return "", false
 		}
 	}
 	// round_robin (and fallback for empty clientIP)
-	start := b.next % n
-	b.next++
+	start := (b.next.Add(1) - 1) % n
 	for i := uint64(0); i < n; i++ {
-		be := b.backends[(start+i)%n]
-		if !needHealthy || b.usableTrackLocked(be, recovered) {
+		be := p.list[(start+i)%n]
+		if !needHealthy || b.usableTrack(be, o, recovered) {
 			return be.addr, true
 		}
 	}
-	return b.backends[start].addr, !needHealthy
+	return p.list[start].addr, !needHealthy
 }
 
-// usableLocked reports whether the backend may serve traffic, applying
+// usable reports whether the backend may serve traffic, applying
 // passive cooldown recovery. recovered reports whether this call flipped the
 // backend from down to healthy (cooldown elapsed); the caller must fire the
-// state-change callback for it after unlocking b.mu. Caller must hold b.mu.
-func (b *Balancer) usableLocked(be *backend) (usable, recovered bool) {
-	if be.healthy {
+// state-change callback for it after its pool read completes. The flip is a
+// CompareAndSwap so concurrent observers fire the callback exactly once.
+func (b *Balancer) usable(be *backend, o *Options) (usable, recovered bool) {
+	if be.healthy.Load() {
 		return true, false
 	}
-	if b.opts.ActiveChecks {
+	if o.ActiveChecks {
 		return false, false // recovery only via ReportSuccess rise path
 	}
-	if time.Since(be.downSince) >= b.opts.Cooldown {
-		be.healthy = true
-		be.errCount = 0
-		return true, true
+	if time.Since(time.Unix(0, be.downSince.Load())) >= o.Cooldown {
+		if be.healthy.CompareAndSwap(false, true) {
+			be.errCount.Store(0)
+			return true, true
+		}
+		return false, false
 	}
 	return false, false
 }
 
-// usableTrackLocked is usableLocked plus collection of recovered addresses.
-// Caller must hold b.mu.
-func (b *Balancer) usableTrackLocked(be *backend, recovered *[]string) bool {
-	usable, rec := b.usableLocked(be)
+// usableTrack is usable plus collection of recovered addresses.
+func (b *Balancer) usableTrack(be *backend, o *Options, recovered *[]string) bool {
+	usable, rec := b.usable(be, o)
 	if rec {
 		*recovered = append(*recovered, be.addr)
 	}
 	return usable
 }
 
-// fireRecovered publishes cooldown recoveries collected under the lock,
-// after unlocking it and in pool order — same discipline as ReportError and
-// ReportSuccess.
-func (b *Balancer) fireRecovered(fn func(addr string, healthy bool), recovered []string) {
-	if fn == nil {
-		return
-	}
+// fireRecovered publishes cooldown recoveries collected during a Pick or
+// Snapshot pool read, after that read completes and in pool order — same
+// discipline as ReportError and ReportSuccess.
+func (b *Balancer) fireRecovered(fn *func(addr string, healthy bool), recovered []string) {
 	for _, addr := range recovered {
-		fn(addr, true)
+		b.fire(fn, addr, true)
 	}
 }
 
@@ -257,68 +270,50 @@ func rendezvous(clientIP, backendAddr string) uint64 {
 // ReportError records a failure against a backend. Fall consecutive errors
 // mark it down.
 func (b *Balancer) ReportError(addr string) {
-	b.mu.Lock()
-	be := b.find(addr)
-	if be == nil {
-		b.mu.Unlock()
+	o := b.opts.Load()
+	p := b.pool.Load()
+	if o == nil || p == nil {
 		return
 	}
-	be.errCount++
-	be.successCount = 0
-	wasHealthy := be.healthy
-	if be.healthy && be.errCount >= b.opts.Fall {
-		be.healthy = false
-		be.downSince = time.Now()
+	be := p.byAddr[addr]
+	if be == nil {
+		return
 	}
-	down := wasHealthy && !be.healthy
-	fn := b.onState
-	b.mu.Unlock()
-	if down && fn != nil {
-		// Fired after unlock so ordering between the down and a following
-		// up transition is deterministic; never called under b.mu.
-		fn(addr, false)
+	n := be.errCount.Add(1)
+	be.successCount.Store(0)
+	if be.healthy.Load() && n >= int64(o.Fall) && be.healthy.CompareAndSwap(true, false) {
+		be.downSince.Store(time.Now().UnixNano())
+		// Fired after the state flip so ordering between the down and a
+		// following up transition is deterministic; never called under a
+		// lock. The CAS winner fires, so a transition fires exactly once.
+		b.fire(b.onStateFn(), addr, false)
 	}
 }
 
 // ReportSuccess records a liveness signal. When healthy it clears the error
 // streak; when down with ActiveChecks it counts toward Rise recovery.
 func (b *Balancer) ReportSuccess(addr string) {
-	b.mu.Lock()
-	be := b.find(addr)
+	o := b.opts.Load()
+	p := b.pool.Load()
+	if o == nil || p == nil {
+		return
+	}
+	be := p.byAddr[addr]
 	if be == nil {
-		b.mu.Unlock()
 		return
 	}
-	if be.healthy {
-		be.errCount = 0
-		b.mu.Unlock()
+	if be.healthy.Load() {
+		be.errCount.Store(0)
 		return
 	}
-	if !b.opts.ActiveChecks {
-		b.mu.Unlock()
+	if !o.ActiveChecks {
 		return
 	}
-	be.successCount++
-	up := be.successCount >= b.opts.Rise
-	if up {
-		be.healthy = true
-		be.errCount = 0
-		be.successCount = 0
+	if be.successCount.Add(1) >= int64(o.Rise) && be.healthy.CompareAndSwap(false, true) {
+		be.errCount.Store(0)
+		be.successCount.Store(0)
+		b.fire(b.onStateFn(), addr, true)
 	}
-	fn := b.onState
-	b.mu.Unlock()
-	if up && fn != nil {
-		fn(addr, true)
-	}
-}
-
-func (b *Balancer) find(addr string) *backend {
-	for _, be := range b.backends {
-		if be.addr == addr {
-			return be
-		}
-	}
-	return nil
 }
 
 // Snapshot returns the current state of every backend. A backend whose
@@ -326,17 +321,19 @@ func (b *Balancer) find(addr string) *backend {
 // as the next Pick would treat it, and that recovery is fired through the
 // state-change callback like any other transition.
 func (b *Balancer) Snapshot() []BackendState {
-	b.mu.Lock()
+	p := b.pool.Load()
+	if p == nil {
+		return nil
+	}
+	o := b.opts.Load()
 	var recovered []string
-	out := make([]BackendState, 0, len(b.backends))
-	for _, be := range b.backends {
-		if _, rec := b.usableLocked(be); rec { // reflect elapsed-cooldown recovery in the view
+	out := make([]BackendState, 0, len(p.list))
+	for _, be := range p.list {
+		if _, rec := b.usable(be, o); rec { // reflect elapsed-cooldown recovery in the view
 			recovered = append(recovered, be.addr)
 		}
-		out = append(out, BackendState{Addr: be.addr, Healthy: be.healthy})
+		out = append(out, BackendState{Addr: be.addr, Healthy: be.healthy.Load()})
 	}
-	fn := b.onState
-	b.mu.Unlock()
-	b.fireRecovered(fn, recovered)
+	b.fireRecovered(b.onStateFn(), recovered)
 	return out
 }
