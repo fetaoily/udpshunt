@@ -249,6 +249,116 @@ func deadAddr(t *testing.T) string {
 	return addr
 }
 
+// sendUDP fires one datagram at dst without waiting for a reply (used to
+// probe session-cap rejection, where no reply ever comes).
+func sendUDP(t *testing.T, dst *net.UDPAddr, payload string) {
+	t.Helper()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	if _, err := pc.WriteToUDP([]byte(payload), dst); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFailedReloadKeepsSessionsCap(t *testing.T) {
+	b1 := startEcho(t)
+	// Occupied port: config B's new listener L2 fails to bind there, so
+	// Apply fails mid-way (the way a real bind conflict does).
+	hold, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { hold.Close() })
+	occupied := hold.LocalAddr().String()
+
+	pA := writeCfg(t, fmt.Sprintf(`
+sessions:
+  max: 1
+listeners:
+  - name: L1
+    bind: 127.0.0.1:0
+    backends: [%s]
+`, b1))
+	app, _ := newApp(t, pA)
+	if err := app.Reload(); err != nil { // startup path: sets the cap, then applies
+		t.Fatal(err)
+	}
+	l1 := app.listeners["L1"].Addr()
+	if got, err := roundTripUDP(t, l1, "a"); err != nil || got != "echo:a" {
+		t.Fatalf("setup: %q %v", got, err)
+	}
+	if got := app.mgr.Rejected(); got != 0 {
+		t.Fatalf("no rejections expected under config A, got %d", got)
+	}
+
+	pB := writeCfg(t, fmt.Sprintf(`
+sessions:
+  max: 999
+listeners:
+  - name: L1
+    bind: 127.0.0.1:0
+    backends: [%s]
+  - name: L2
+    bind: %s
+    backends: [%s]
+`, b1, occupied, b1))
+	app.cfgPath = pB
+	if err := app.Reload(); err == nil {
+		t.Fatal("reload must fail on the L2 bind conflict")
+	}
+	// A second client must still be rejected under config A's cap of 1; the
+	// failed reload must not have moved the cap to config B's 999.
+	sendUDP(t, l1, "b")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && app.mgr.Rejected() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := app.mgr.Rejected(); got != 1 {
+		t.Fatalf("sessions cap must stay at config A's 1 after a failed reload, rejected = %d", got)
+	}
+}
+
+func TestPoolChangeKeepsSurvivingBackendSessions(t *testing.T) {
+	b1 := startEcho(t)
+	b2 := startEcho(t)
+	p := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s, %s]\n", b1, b2), ""))
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	l1 := app.listeners["L1"].Addr()
+	// First round-robin pick lands on b1 (pool order): one session there.
+	if got, err := roundTripUDP(t, l1, "x"); err != nil || got != "echo:x" {
+		t.Fatalf("setup: %q %v", got, err)
+	}
+	if n := app.mgr.BackendCount("L1", b1); n != 1 {
+		t.Fatalf("one session on b1 expected, got %d", n)
+	}
+	expired := app.mgr.Expired()
+
+	// Change the OTHER backend (drop b2): b1's session must survive the
+	// pool update untouched.
+	p2 := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1), ""))
+	if err := app.Apply(context.Background(), mustLoad(t, p2)); err != nil {
+		t.Fatal(err)
+	}
+	if n := app.mgr.BackendCount("L1", b1); n != 1 {
+		t.Fatalf("surviving backend must keep its session, got %d", n)
+	}
+	if n := app.mgr.BackendCount("L1", b2); n != 0 {
+		t.Fatalf("dropped backend must have no sessions, got %d", n)
+	}
+	if app.mgr.Expired() != expired {
+		t.Fatalf("no eviction may hit the surviving backend, expired %d -> %d",
+			expired, app.mgr.Expired())
+	}
+}
+
 func TestStatusAndAdminEndpoints(t *testing.T) {
 	b1 := startEcho(t)
 	p := writeCfg(t, cfgYAML(fmt.Sprintf(

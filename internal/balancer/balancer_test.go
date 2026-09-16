@@ -187,6 +187,51 @@ func TestSetHealthLive(t *testing.T) {
 	}
 }
 
+func TestPassiveCooldownRecoveryFiresOnState(t *testing.T) {
+	// Recovery observed through Pick.
+	b := New([]string{"b:1"}, Options{Fall: 1, Cooldown: 20 * time.Millisecond})
+	var mu sync.Mutex
+	var ups []string
+	b.SetOnStateChange(func(addr string, healthy bool) {
+		mu.Lock()
+		if healthy {
+			ups = append(ups, addr)
+		}
+		mu.Unlock()
+	})
+	b.ReportError("b:1") // fall=1: down (fires the down transition)
+	time.Sleep(30 * time.Millisecond)
+	if b.Pick("") != "b:1" {
+		t.Fatal("pick must serve the backend again after cooldown")
+	}
+	mu.Lock()
+	if len(ups) != 1 || ups[0] != "b:1" {
+		mu.Unlock()
+		t.Fatalf("Pick must fire onState(b:1, true) on cooldown recovery, got %v", ups)
+	}
+	mu.Unlock()
+
+	// Recovery observed through Snapshot on a fresh balancer, still with no
+	// ReportSuccess anywhere: only the passive cooldown recovers.
+	b2 := New([]string{"a:1"}, Options{Fall: 1, Cooldown: 20 * time.Millisecond})
+	var ups2 []string
+	b2.SetOnStateChange(func(addr string, healthy bool) {
+		mu.Lock()
+		if healthy {
+			ups2 = append(ups2, addr)
+		}
+		mu.Unlock()
+	})
+	b2.ReportError("a:1")
+	time.Sleep(30 * time.Millisecond)
+	b2.Snapshot()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ups2) != 1 || ups2[0] != "a:1" {
+		t.Fatalf("Snapshot must fire onState(a:1, true) on cooldown recovery, got %v", ups2)
+	}
+}
+
 func TestOnStateChangeBothDirections(t *testing.T) {
 	b := New([]string{"a:1"}, Options{Fall: 1, Rise: 1, ActiveChecks: true})
 	var mu sync.Mutex

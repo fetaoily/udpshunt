@@ -59,6 +59,59 @@ func TestRegistryExposesMetrics(t *testing.T) {
 	}
 }
 
+func TestSeedBackendHealthyDoesNotCountTransition(t *testing.T) {
+	m := New()
+	m.backendFlips.WithLabelValues("t", "b:1") // materialize the counter at 0
+	m.SeedBackendHealthy("t", "b:1", true)
+	if got := metricValue(t, m, "udpshunt_backend_healthy", "t", "b:1"); got != 1 {
+		t.Fatalf("seeded gauge = %v, want 1", got)
+	}
+	if got := metricValue(t, m, "udpshunt_backend_state_changes_total", "t", "b:1"); got != 0 {
+		t.Fatalf("seed must not count a state transition, got %v", got)
+	}
+	m.SetBackendHealthy("t", "b:1", false)
+	if got := metricValue(t, m, "udpshunt_backend_healthy", "t", "b:1"); got != 0 {
+		t.Fatalf("gauge = %v, want 0", got)
+	}
+	if got := metricValue(t, m, "udpshunt_backend_state_changes_total", "t", "b:1"); got != 1 {
+		t.Fatalf("real transition must count, got %v", got)
+	}
+}
+
+// metricValue reads one labeled sample from the private registry.
+func metricValue(t *testing.T, m *Metrics, name, listener, backend string) float64 {
+	t.Helper()
+	fams, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range fams {
+		if f.GetName() != name {
+			continue
+		}
+		for _, mf := range f.GetMetric() {
+			var l, b string
+			for _, lbl := range mf.GetLabel() {
+				switch lbl.GetName() {
+				case "listener":
+					l = lbl.GetValue()
+				case "backend":
+					b = lbl.GetValue()
+				}
+			}
+			if l != listener || b != backend {
+				continue
+			}
+			if mf.GetGauge() != nil {
+				return mf.GetGauge().GetValue()
+			}
+			return mf.GetCounter().GetValue()
+		}
+	}
+	t.Fatalf("metric %s{listener=%q,backend=%q} not found", name, listener, backend)
+	return 0
+}
+
 func TestNilListenerMetricsSafe(t *testing.T) {
 	var lm *ListenerMetrics
 	lm.PacketsIn(1) // must not panic

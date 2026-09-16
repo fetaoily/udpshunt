@@ -22,8 +22,8 @@ triggers a graceful drain.
 `balance` selects how new sessions pick a backend:
 
 - `round_robin` — even rotation across healthy backends (default).
-- `least_sessions` — backend with the fewest live sessions; ties break round-robin.
-- `source_hash` — stable hash of the client IP, so a client keeps its backend as long as it stays healthy; falls open to round-robin when it is down.
+- `least_sessions` — backend with the fewest live sessions; ties keep the earliest backend in stable pool order.
+- `source_hash` — stable rendezvous hash of the client IP, so a client keeps its backend as long as it stays healthy; when no backend is healthy it fails open via the same rendezvous hash over all backends.
 
 ## Health checks
 

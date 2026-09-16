@@ -134,14 +134,25 @@ func (lm *ListenerMetrics) SessionCreated() {
 }
 
 // SetBackendHealthy updates the per-backend health gauge and counts the
-// state transition.
+// state transition. Call it only on real UP<->DOWN transitions; use
+// SeedBackendHealthy to initialize without counting.
 func (m *Metrics) SetBackendHealthy(listener, backend string, healthy bool) {
-	v := 0.0
-	if healthy {
-		v = 1
-	}
-	m.backendUp.WithLabelValues(listener, backend).Set(v)
+	m.backendUp.WithLabelValues(listener, backend).Set(healthyValue(healthy))
 	m.backendFlips.WithLabelValues(listener, backend).Inc()
+}
+
+// SeedBackendHealthy initializes the per-backend health gauge without
+// counting a state transition (listener start, reseeding after a pool
+// update).
+func (m *Metrics) SeedBackendHealthy(listener, backend string, healthy bool) {
+	m.backendUp.WithLabelValues(listener, backend).Set(healthyValue(healthy))
+}
+
+func healthyValue(healthy bool) float64 {
+	if healthy {
+		return 1
+	}
+	return 0
 }
 
 func (m *Metrics) IncReload()        { m.reloads.Inc() }

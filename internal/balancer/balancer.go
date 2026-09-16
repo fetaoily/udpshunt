@@ -16,12 +16,15 @@ const (
 // The zero value behaves like M1: round_robin, fall 3, passive cooldown
 // recovery.
 type Options struct {
-	Balance      string                  // round_robin | least_sessions | source_hash
-	Fall         int                     // consecutive errors before down (default 3)
-	Rise         int                     // consecutive successes to recover (default 2)
-	Cooldown     time.Duration           // passive recovery cooldown (default 10s)
-	ActiveChecks bool                    // true: recovery needs Rise successes (no cooldown path)
-	Counts       func(addr string) int64 // live session count, least_sessions only
+	Balance      string        // round_robin | least_sessions | source_hash
+	Fall         int           // consecutive errors before down (default 3)
+	Rise         int           // consecutive successes to recover (default 2)
+	Cooldown     time.Duration // passive recovery cooldown (default 10s)
+	ActiveChecks bool          // true: recovery needs Rise successes (no cooldown path)
+	// Counts reports the live session count per backend (least_sessions
+	// only). It is called under the balancer lock and must not re-enter
+	// the Balancer.
+	Counts func(addr string) int64
 }
 
 // BackendState is a point-in-time view of one backend.
@@ -119,24 +122,27 @@ func (b *Balancer) SetOnStateChange(fn func(addr string, healthy bool)) {
 // assumption B) and returns "" for an empty pool.
 func (b *Balancer) Pick(clientIP string) string {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	var recovered []string
 	if len(b.backends) == 0 {
+		b.mu.Unlock()
 		return ""
 	}
-	addr, ok := b.pickHealthyLocked(clientIP)
-	if ok {
-		return addr
+	addr, ok := b.pickHealthyLocked(clientIP, &recovered)
+	if !ok {
+		// fail-open: same algorithm ignoring health
+		addr, _ = b.pickLocked(clientIP, false, &recovered)
 	}
-	// fail-open: same algorithm ignoring health
-	addr, _ = b.pickLocked(clientIP, false)
+	fn := b.onState
+	b.mu.Unlock()
+	b.fireRecovered(fn, recovered)
 	return addr
 }
 
-func (b *Balancer) pickHealthyLocked(clientIP string) (string, bool) {
-	return b.pickLocked(clientIP, true)
+func (b *Balancer) pickHealthyLocked(clientIP string, recovered *[]string) (string, bool) {
+	return b.pickLocked(clientIP, true, recovered)
 }
 
-func (b *Balancer) pickLocked(clientIP string, needHealthy bool) (string, bool) {
+func (b *Balancer) pickLocked(clientIP string, needHealthy bool, recovered *[]string) (string, bool) {
 	n := uint64(len(b.backends))
 	switch b.opts.Balance {
 	case "least_sessions":
@@ -144,7 +150,7 @@ func (b *Balancer) pickLocked(clientIP string, needHealthy bool) (string, bool) 
 			best := -1
 			var bestCount int64
 			for i, be := range b.backends {
-				if needHealthy && !b.usableLocked(be) {
+				if needHealthy && !b.usableTrackLocked(be, recovered) {
 					continue
 				}
 				c := b.opts.Counts(be.addr)
@@ -163,7 +169,7 @@ func (b *Balancer) pickLocked(clientIP string, needHealthy bool) (string, bool) 
 			best := -1
 			var bestHash uint64
 			for i, be := range b.backends {
-				if needHealthy && !b.usableLocked(be) {
+				if needHealthy && !b.usableTrackLocked(be, recovered) {
 					continue
 				}
 				h := rendezvous(clientIP, be.addr)
@@ -182,7 +188,7 @@ func (b *Balancer) pickLocked(clientIP string, needHealthy bool) (string, bool) 
 	b.next++
 	for i := uint64(0); i < n; i++ {
 		be := b.backends[(start+i)%n]
-		if !needHealthy || b.usableLocked(be) {
+		if !needHealthy || b.usableTrackLocked(be, recovered) {
 			return be.addr, true
 		}
 	}
@@ -190,20 +196,44 @@ func (b *Balancer) pickLocked(clientIP string, needHealthy bool) (string, bool) 
 }
 
 // usableLocked reports whether the backend may serve traffic, applying
-// passive cooldown recovery. Caller must hold b.mu.
-func (b *Balancer) usableLocked(be *backend) bool {
+// passive cooldown recovery. recovered reports whether this call flipped the
+// backend from down to healthy (cooldown elapsed); the caller must fire the
+// state-change callback for it after unlocking b.mu. Caller must hold b.mu.
+func (b *Balancer) usableLocked(be *backend) (usable, recovered bool) {
 	if be.healthy {
-		return true
+		return true, false
 	}
 	if b.opts.ActiveChecks {
-		return false // recovery only via ReportSuccess rise path
+		return false, false // recovery only via ReportSuccess rise path
 	}
 	if time.Since(be.downSince) >= b.opts.Cooldown {
 		be.healthy = true
 		be.errCount = 0
-		return true
+		return true, true
 	}
-	return false
+	return false, false
+}
+
+// usableTrackLocked is usableLocked plus collection of recovered addresses.
+// Caller must hold b.mu.
+func (b *Balancer) usableTrackLocked(be *backend, recovered *[]string) bool {
+	usable, rec := b.usableLocked(be)
+	if rec {
+		*recovered = append(*recovered, be.addr)
+	}
+	return usable
+}
+
+// fireRecovered publishes cooldown recoveries collected under the lock,
+// after unlocking it and in pool order — same discipline as ReportError and
+// ReportSuccess.
+func (b *Balancer) fireRecovered(fn func(addr string, healthy bool), recovered []string) {
+	if fn == nil {
+		return
+	}
+	for _, addr := range recovered {
+		fn(addr, true)
+	}
 }
 
 // rendezvous implements highest-random-weight hashing: the (client, backend)
@@ -293,14 +323,20 @@ func (b *Balancer) find(addr string) *backend {
 
 // Snapshot returns the current state of every backend. A backend whose
 // passive cooldown has elapsed reports (and becomes) healthy again, exactly
-// as the next Pick would treat it.
+// as the next Pick would treat it, and that recovery is fired through the
+// state-change callback like any other transition.
 func (b *Balancer) Snapshot() []BackendState {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	var recovered []string
 	out := make([]BackendState, 0, len(b.backends))
 	for _, be := range b.backends {
-		b.usableLocked(be) // reflect elapsed-cooldown recovery in the view
+		if _, rec := b.usableLocked(be); rec { // reflect elapsed-cooldown recovery in the view
+			recovered = append(recovered, be.addr)
+		}
 		out = append(out, BackendState{Addr: be.addr, Healthy: be.healthy})
 	}
+	fn := b.onState
+	b.mu.Unlock()
+	b.fireRecovered(fn, recovered)
 	return out
 }

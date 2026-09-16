@@ -30,9 +30,13 @@ type App struct {
 	started   time.Time
 	listeners map[string]*listener.Listener
 	balancers map[string]*balancer.Balancer
-	probes    map[string]*health.Prober
-	cancels   map[string]context.CancelFunc
-	runDone   map[string]chan struct{}
+	// binds records the bind of each running listener as configured at
+	// start time, so Apply compares against what is actually running
+	// instead of a.cfg, which a partially failed Apply may leave stale.
+	binds   map[string]string
+	probes  map[string]*health.Prober
+	cancels map[string]context.CancelFunc
+	runDone map[string]chan struct{}
 	// lctxs holds each listener's derived ctx: probes must die with their
 	// listener, so they take this ctx — never the Apply ctx (Background
 	// under Reload), which nothing cancels.
@@ -49,6 +53,7 @@ func NewApp(cfgPath string, logger *slog.Logger) *App {
 		started:   time.Now(),
 		listeners: map[string]*listener.Listener{},
 		balancers: map[string]*balancer.Balancer{},
+		binds:     map[string]string{},
 		probes:    map[string]*health.Prober{},
 		cancels:   map[string]context.CancelFunc{},
 		runDone:   map[string]chan struct{}{},
@@ -70,8 +75,10 @@ func (a *App) Apply(ctx context.Context, cfg config.Config) error {
 		}
 	}
 	for _, lc := range cfg.Listeners {
-		oldBind := boundOf(a.cfg, lc.Name)
-		if _, exists := a.listeners[lc.Name]; exists && oldBind == lc.Bind {
+		// Compare against the bind actually running, not a.cfg: after a
+		// partially failed Apply, a.cfg is stale and the diff would restart
+		// an already correctly-bound listener, evicting its sessions.
+		if _, exists := a.listeners[lc.Name]; exists && a.binds[lc.Name] == lc.Bind {
 			a.updateListenerLocked(lc)
 			continue
 		}
@@ -104,15 +111,6 @@ func hasBackend(addrs []string, addr string) bool {
 	return false
 }
 
-func boundOf(cfg config.Config, name string) string {
-	for _, l := range cfg.Listeners {
-		if l.Name == name {
-			return l.Bind
-		}
-	}
-	return ""
-}
-
 func (a *App) startListenerLocked(ctx context.Context, lc config.Listener) error {
 	bal := balancer.New(lc.Backends, balancer.Options{
 		Balance:      lc.Balance,
@@ -142,6 +140,14 @@ func (a *App) startListenerLocked(ctx context.Context, lc config.Listener) error
 	a.cancels[lc.Name] = cancel
 	a.runDone[lc.Name] = done
 	a.lctxs[lc.Name] = lctx
+	a.binds[lc.Name] = lc.Bind
+	// Seed every backend's gauge before the receive loop starts, so
+	// /metrics reports health from the first scrape — a bind-change reload
+	// builds a fresh balancer under the same Prometheus labels and would
+	// otherwise inherit a stale value.
+	for _, addr := range lc.Backends {
+		a.met.SeedBackendHealthy(lc.Name, addr, true)
+	}
 	go func() {
 		defer close(done)
 		if err := l.Run(lctx); err != nil {
@@ -166,15 +172,26 @@ func (a *App) startProbeLocked(ctx context.Context, lc config.Listener) {
 
 func (a *App) updateListenerLocked(lc config.Listener) {
 	bal := a.balancers[lc.Name]
-	// spec §3: a backend leaving the pool terminates its sessions. Diff the
-	// live pool (not a.cfg, which a failed Apply may have left stale), then
-	// repool and evict.
+	// spec §3: a backend leaving the pool terminates its sessions. Repool
+	// FIRST, so Pick can no longer select a departing backend, and only
+	// then evict: a session that slipped onto a departing backend before
+	// the swap is still closed by this sweep. Diffed against the live pool
+	// (not a.cfg, which a failed Apply may have left stale).
+	var departing []string
 	for _, old := range bal.Snapshot() {
 		if !hasBackend(lc.Backends, old.Addr) {
-			a.mgr.CloseBackend(lc.Name, old.Addr)
+			departing = append(departing, old.Addr)
 		}
 	}
 	bal.Update(lc.Backends)
+	for _, addr := range departing {
+		a.mgr.CloseBackend(lc.Name, addr)
+	}
+	// Re-seed the gauges for the new pool: new backends start healthy and
+	// survivors keep their state, so seed from the actual post-Update view.
+	for _, st := range bal.Snapshot() {
+		a.met.SeedBackendHealthy(lc.Name, st.Addr, st.Healthy)
+	}
 	bal.SetBalance(lc.Balance)
 	bal.SetHealth(healthEnabled(lc.HealthCheck), lc.HealthCheck.Rise, lc.HealthCheck.Fall)
 	a.listeners[lc.Name].UpdateTimeout(time.Duration(lc.SessionTimeout))
@@ -206,6 +223,7 @@ func (a *App) stopListenerLocked(name string) {
 		a.events.Add("listener_stopped", fmt.Sprintf("%s closed=%d", name, n))
 	}
 	delete(a.balancers, name)
+	delete(a.binds, name)
 	delete(a.cancels, name)
 	delete(a.runDone, name)
 	delete(a.lctxs, name)
@@ -221,7 +239,6 @@ func (a *App) Reload() error {
 		a.logger.Error("reload failed, keeping previous config", "err", err)
 		return err
 	}
-	a.mgr.SetMax(int64(cfg.Sessions.Max))
 	ctx := context.Background()
 	if err := a.Apply(ctx, cfg); err != nil {
 		a.met.IncReloadFailure()
@@ -229,6 +246,9 @@ func (a *App) Reload() error {
 		a.logger.Error("reload failed, keeping previous config", "err", err)
 		return err
 	}
+	// spec §6: a failed reload changes nothing, so the sessions cap moves
+	// only after Apply has succeeded.
+	a.mgr.SetMax(int64(cfg.Sessions.Max))
 	a.met.IncReload()
 	a.events.Add("reload", "ok")
 	a.logger.Info("config reloaded", "listeners", len(cfg.Listeners))
@@ -265,8 +285,14 @@ func (a *App) Status() admin.Status {
 			total += n
 			bs = append(bs, admin.BackendStatus{Addr: bt.Addr, Healthy: bt.Healthy, Sessions: n})
 		}
+		// Report the bind actually running when known; a.cfg may be stale
+		// after a partially failed Apply.
+		bind := lc.Bind
+		if actual, ok := a.binds[lc.Name]; ok {
+			bind = actual
+		}
 		st.Listeners = append(st.Listeners, admin.ListenerStatus{
-			Name: lc.Name, Bind: lc.Bind, Balance: lc.Balance, Backends: bs, Sessions: total,
+			Name: lc.Name, Bind: bind, Balance: lc.Balance, Backends: bs, Sessions: total,
 		})
 	}
 	return st
