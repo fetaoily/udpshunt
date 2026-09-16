@@ -36,7 +36,9 @@ type model struct {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(fetchCmd(m), tickCmd(m.interval))
+	// Start with one fetch; statusMsg re-arms the tick, forming a single
+	// fetch -> status -> tick -> fetch chain (no duplicate polling chains).
+	return fetchCmd(m)
 }
 
 func tickCmd(interval time.Duration) tea.Cmd {
