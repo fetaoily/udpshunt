@@ -65,11 +65,12 @@ what is running.
 
 ## Admin API
 
-`admin.bind` serves three endpoints:
+`admin.bind` serves four routes:
 
 - `GET /metrics` — Prometheus text format (private registry, `udpshunt_` prefix).
-- `GET /status` — JSON snapshot: uptime, per-listener backends (health, session counts), session totals, recent events.
+- `GET /status` — JSON snapshot: uptime, per-listener backends (health, session counts), session totals, recent events, and per-listener rate history (last 5 min at 1s samples).
 - `POST /reload` — reload the config file and apply it.
+- `GET /ui` — the embedded web dashboard (below).
 
 ## Terminal dashboard
 
@@ -135,9 +136,10 @@ heap only: kernel socket buffers and the receive arena are outside it.
 
 Each listener holds ~4 MiB of kernel receive buffers by default (see
 `read_buffer` above; Linux doubles `SO_RCVBUF` requests, so 4 MiB requested
-is about an 8 MiB kernel ceiling), plus a 64×64 KiB receive arena and pooled
-relay buffers (relay memory scales with in-flight packets, not live
-sessions). Size `GOMEMLIMIT` with that baseline in mind.
+is about an 8 MiB kernel ceiling), plus a receive arena and pooled relay
+buffers (relay memory scales with in-flight packets, not live sessions). The
+64×64 KiB (4 MiB) arena is Linux-only; non-Linux platforms size a
+single-packet arena. Size `GOMEMLIMIT` with that baseline in mind.
 
 ## Performance
 

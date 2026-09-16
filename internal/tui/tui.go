@@ -12,6 +12,11 @@ import (
 	"github.com/fetaoily/udpshunt/internal/admin"
 )
 
+// httpClient bounds each status poll: the TUI polls on a single
+// fetch -> status -> tick chain, so a hung request without a deadline would
+// freeze the dashboard forever.
+var httpClient = &http.Client{Timeout: 5 * time.Second}
+
 // Run starts the dashboard against the admin API at addr, polling every
 // interval. It blocks until the user quits (q / Ctrl-C).
 func Run(addr string, interval time.Duration) error {
@@ -54,7 +59,7 @@ func fetchCmd(m model) tea.Cmd {
 
 func fetchStatus(addr string) (admin.Status, error) {
 	var st admin.Status
-	resp, err := http.Get(strings.TrimRight(addr, "/") + "/status")
+	resp, err := httpClient.Get(strings.TrimRight(addr, "/") + "/status")
 	if err != nil {
 		return st, err
 	}
