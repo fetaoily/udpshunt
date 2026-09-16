@@ -14,6 +14,7 @@ import (
 	"github.com/fetaoily/udpshunt/internal/balancer"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/metrics"
+	"github.com/fetaoily/udpshunt/internal/pktio"
 	"github.com/fetaoily/udpshunt/internal/session"
 )
 
@@ -24,6 +25,7 @@ const defaultReadBuffer = 4 << 20 // 4 MiB
 type Listener struct {
 	name     string
 	pc       *net.UDPConn
+	io       *pktio.Conn
 	bal      *balancer.Balancer
 	mgr      *session.Manager
 	met      *metrics.ListenerMetrics
@@ -70,6 +72,7 @@ func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.
 	return &Listener{
 		name:     name,
 		pc:       pc,
+		io:       pktio.Wrap(pc),
 		bal:      bal,
 		mgr:      mgr,
 		met:      met,
@@ -98,23 +101,29 @@ func (l *Listener) UpdateTimeout(d time.Duration) {
 	l.mu.Unlock()
 }
 
+const recvBatchSize = 64
+
 // Run receives packets until ctx is cancelled. Cancellation stops the receive
 // loop without closing the socket: it must stay writable for the downstream
 // drain window; call Close once draining is done (spec §10).
 func (l *Listener) Run(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
-		// Unblock the pending ReadFromUDP via an already-expired read
+		// Unblock the pending batch read via an already-expired read
 		// deadline instead of closing the socket.
 		_ = l.pc.SetReadDeadline(time.Now())
 	}()
-	buf := make([]byte, maxPacketSize)
+	raw := make([]byte, recvBatchSize*pktio.MaxPacketSize)
+	bufs := make([][]byte, recvBatchSize)
+	for i := range bufs {
+		bufs[i] = raw[i*pktio.MaxPacketSize : (i+1)*pktio.MaxPacketSize]
+	}
+	addrs := make([]*net.UDPAddr, recvBatchSize)
+	sizes := make([]int, recvBatchSize)
 	for {
-		n, client, err := l.pc.ReadFromUDP(buf)
+		n, err := l.io.ReceiveBatch(bufs, addrs, sizes)
 		if err != nil {
 			if ctx.Err() != nil {
-				// Cancellation path: the watcher's read deadline unblocked
-				// the pending read; stop receiving cleanly.
 				return nil
 			}
 			if errors.Is(err, net.ErrClosed) {
@@ -128,9 +137,11 @@ func (l *Listener) Run(ctx context.Context) error {
 			// it instead of creating sessions during shutdown.
 			return nil
 		}
-		l.met.PacketsIn(1)
-		l.met.BytesIn(n)
-		l.handle(client, buf[:n])
+		for i := 0; i < n; i++ {
+			l.met.PacketsIn(1)
+			l.met.BytesIn(sizes[i])
+			l.handle(addrs[i], bufs[i][:sizes[i]])
+		}
 	}
 }
 
