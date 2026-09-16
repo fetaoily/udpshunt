@@ -227,14 +227,20 @@ func (l *Listener) startDownstream(s *session.Session) bool {
 	return true
 }
 
+// downstreamBufs recycles relay buffers: a buffer is held only for one
+// read->write span, so memory scales with in-flight packets rather than
+// with live sessions.
+var downstreamBufs = sync.Pool{New: func() any { return make([]byte, maxPacketSize) }}
+
 // downstream relays backend replies back to the client through the
 // listener socket.
 func (l *Listener) downstream(s *session.Session) {
 	defer l.wg.Done()
-	buf := make([]byte, maxPacketSize)
 	for {
+		buf := downstreamBufs.Get().([]byte)
 		n, err := s.Upstream().Read(buf)
 		if err != nil {
+			downstreamBufs.Put(buf)
 			if !errors.Is(err, net.ErrClosed) {
 				l.met.BackendError(s.Backend)
 				l.bal.ReportError(s.Backend)
@@ -243,8 +249,10 @@ func (l *Listener) downstream(s *session.Session) {
 			return
 		}
 		s.Touch()
-		if _, err := l.pc.WriteToUDP(buf[:n], s.Client); err != nil {
-			if errors.Is(err, net.ErrClosed) {
+		_, werr := l.pc.WriteToUDP(buf[:n], s.Client)
+		downstreamBufs.Put(buf)
+		if werr != nil {
+			if errors.Is(werr, net.ErrClosed) {
 				return
 			}
 			l.met.BackendError(s.Backend)
