@@ -11,10 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fetaoily/udpshunt/internal/balancer"
+	"github.com/fetaoily/udpshunt/internal/admin"
 	"github.com/fetaoily/udpshunt/internal/config"
-	"github.com/fetaoily/udpshunt/internal/listener"
-	"github.com/fetaoily/udpshunt/internal/session"
 )
 
 func main() {
@@ -37,62 +35,44 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	mgr := session.NewManager(int64(cfg.Sessions.Max))
-	mgr.Start(ctx, time.Second) // spec §3: sweep 1/8 of shards per second
+	app := NewApp(*cfgPath, logger)
+	app.met.SetStartedAt(time.Now())
+	app.met.SetSessionStats(app.mgr.Created, app.mgr.Expired, app.mgr.Rejected,
+		func() int64 { return int64(app.mgr.Count()) })
+	app.mgr.SetMax(int64(cfg.Sessions.Max))
+	app.mgr.Start(ctx, time.Second) // spec §3: sweep 1/8 of shards per second
 
-	ls := make([]*listener.Listener, 0, len(cfg.Listeners))
-	for _, lc := range cfg.Listeners {
-		l, err := buildListener(lc, mgr, logger)
-		if err != nil {
-			return fmt.Errorf("listener %s: %w", lc.Name, err)
+	adminSrv := admin.New(cfg.Admin.Bind, admin.Deps{
+		Registry: app.met.Registry(),
+		Status:   app.Status,
+		Reload:   app.Reload,
+		Logger:   logger,
+	})
+	go func() {
+		if err := adminSrv.Run(ctx); err != nil {
+			logger.Error("admin server stopped", "err", err)
 		}
-		ls = append(ls, l)
+	}()
+
+	sighup := make(chan os.Signal, 1)
+	signal.Notify(sighup, syscall.SIGHUP) // never delivered on Windows; harmless
+	go func() {
+		for range sighup {
+			_ = app.Reload()
+		}
+	}()
+
+	if err := app.Apply(ctx, cfg); err != nil {
+		return err
 	}
-	for _, l := range ls {
-		go func(l *listener.Listener) {
-			if err := l.Run(ctx); err != nil {
-				logger.Error("listener stopped with error", "err", err)
-			}
-		}(l)
-	}
-	logger.Info("udpshunt started",
-		"listeners", len(ls),
-		"session_timeout", time.Duration(cfg.Sessions.Timeout).String(),
-	)
+	logger.Info("udpshunt started", "listeners", len(cfg.Listeners), "admin", cfg.Admin.Bind)
 
 	<-ctx.Done()
 	logger.Info("shutting down")
-	// Spec §10: stop receiving, give downstream relays a flush window, close
-	// sessions, then close the frontend sockets.
-	for _, l := range ls {
-		l.WaitDownstream(2 * time.Second)
-	}
-	mgr.CloseAll()
-	for _, l := range ls {
-		if err := l.Close(); err != nil {
-			logger.Warn("close listener socket failed", "err", err)
-		}
-	}
+	// Spec §10: stop receiving, give downstream relays a shared flush
+	// window, close sessions, then close the frontend sockets.
+	app.Shutdown(2 * time.Second)
 	return nil
-}
-
-// buildListener wires one configured listener with its own balancer and the
-// shared session manager.
-func buildListener(lc config.Listener, mgr *session.Manager, logger *slog.Logger) (*listener.Listener, error) {
-	bal := balancer.New(lc.Backends, balancer.Options{})
-	bal.SetOnStateChange(func(addr string, healthy bool) {
-		if healthy {
-			logger.Info("backend marked up", "listener", lc.Name, "backend", addr)
-			return
-		}
-		n := mgr.CloseBackend(lc.Name, addr)
-		logger.Info("backend marked down, sessions closed", "listener", lc.Name, "backend", addr, "sessions", n)
-	})
-	l, err := listener.New(lc.Name, lc, bal, mgr, logger, nil)
-	if err != nil {
-		return nil, err
-	}
-	return l, nil
 }
 
 func newLogger(lc config.Logging) *slog.Logger {
