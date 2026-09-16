@@ -178,12 +178,12 @@ listeners:
     backends: [127.0.0.1:19001]
 `
 	cases := map[string]string{
-		"bad balance":             base + "  balance: magic\n",
-		"bad hc mode":             base + "  health_check:\n    mode: tcp\n",
-		"raw no payload":          base + "  health_check:\n    mode: raw\n",
-		"raw bad payload":         base + "  health_check:\n    mode: raw\n    payload: zz\n",
-		"hc timeout >= interval":  base + "  health_check:\n    mode: dns\n    interval: 1s\n    timeout: 2s\n",
-		"bad rise":                base + "  health_check:\n    mode: dns\n    rise: 0\n",
+		"bad balance":             base + "    balance: magic\n",
+		"bad hc mode":             base + "    health_check:\n      mode: tcp\n",
+		"raw no payload":          base + "    health_check:\n      mode: raw\n",
+		"raw bad payload":         base + "    health_check:\n      mode: raw\n      payload: zz\n",
+		"hc timeout >= interval":  base + "    health_check:\n      mode: dns\n      interval: 1s\n      timeout: 2s\n",
+		"bad rise":                base + "    health_check:\n      mode: dns\n      rise: -1\n",
 		"bad admin bind":          base + "admin:\n  bind: nope\n",
 		"negative global timeout": base + "sessions:\n  timeout: -1s\n",
 		"unknown field":           base + "sessions:\n  mx: 1\n",
