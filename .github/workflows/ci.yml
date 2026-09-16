@@ -18,6 +18,7 @@ jobs:
     # are noise on every push, so this job never fires on push or PR.
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

@@ -24,13 +24,9 @@ func benchPair(b *testing.B) (recv *net.UDPConn, wrapped *Conn, sender *net.UDPC
 	return rpc, Wrap(rpc), spc
 }
 
-func drainBatch(c *Conn, want int) {
-	bufs := make([][]byte, 64)
-	for i := range bufs {
-		bufs[i] = make([]byte, MaxPacketSize)
-	}
-	addrs := make([]*net.UDPAddr, 64)
-	sizes := make([]int, 64)
+// drainBatch reads want packets through c into caller-owned buffers, so no
+// allocation lands inside the timed loop.
+func drainBatch(c *Conn, bufs [][]byte, addrs []*net.UDPAddr, sizes []int, want int) {
 	got := 0
 	for got < want {
 		n, err := c.ReceiveBatch(bufs, addrs, sizes)
@@ -44,6 +40,12 @@ func drainBatch(c *Conn, want int) {
 func BenchmarkReceiveBatch64(b *testing.B) {
 	_, c, sender := benchPair(b)
 	payload := make([]byte, 512)
+	bufs := make([][]byte, 64)
+	for i := range bufs {
+		bufs[i] = make([]byte, MaxPacketSize)
+	}
+	addrs := make([]*net.UDPAddr, 64)
+	sizes := make([]int, 64)
 	b.ResetTimer()
 	for i := 0; i < b.N; i += 64 {
 		end := 64
@@ -55,7 +57,7 @@ func BenchmarkReceiveBatch64(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
-		drainBatch(c, end)
+		drainBatch(c, bufs, addrs, sizes, end)
 	}
 }
 
