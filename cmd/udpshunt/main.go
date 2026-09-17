@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -18,6 +19,30 @@ import (
 	"github.com/fetaoily/udpshunt/internal/webui"
 )
 
+// version is stamped at release time via
+// -ldflags "-X main.version=..." (goreleaser); source builds report "dev".
+var version = "dev"
+
+type cliOptions struct {
+	cfgPath     string
+	showVersion bool
+}
+
+func parseArgs(args []string) (cliOptions, error) {
+	var o cliOptions
+	fs := flag.NewFlagSet("udpshunt", flag.ContinueOnError)
+	fs.StringVar(&o.cfgPath, "c", "/etc/udpshunt.yaml", "path to YAML config file")
+	fs.BoolVar(&o.showVersion, "v", false, "print version and exit")
+	if err := fs.Parse(args); err != nil {
+		return o, err
+	}
+	return o, nil
+}
+
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "udpshunt %s\n", version)
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "udpshunt:", err)
@@ -29,10 +54,19 @@ func run() error {
 	if len(os.Args) > 1 && os.Args[1] == "tui" {
 		return runTUI(os.Args[2:])
 	}
-	cfgPath := flag.String("c", "/etc/udpshunt.yaml", "path to YAML config file")
-	flag.Parse()
+	opts, err := parseArgs(os.Args[1:])
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil // usage already printed; --help is not an error
+		}
+		return err
+	}
+	if opts.showVersion {
+		printVersion(os.Stdout)
+		return nil
+	}
 
-	cfg, err := config.Load(*cfgPath)
+	cfg, err := config.Load(opts.cfgPath)
 	if err != nil {
 		return err
 	}
@@ -41,7 +75,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	app := NewApp(*cfgPath, logger)
+	app := NewApp(opts.cfgPath, logger)
 	app.met.SetStartedAt(time.Now())
 	app.met.SetSessionStats(app.mgr.Created, app.mgr.Expired, app.mgr.Rejected,
 		func() int64 { return int64(app.mgr.Count()) })
@@ -73,7 +107,7 @@ func run() error {
 	if err := app.Apply(ctx, cfg); err != nil {
 		return err
 	}
-	logger.Info("udpshunt started", "listeners", len(cfg.Listeners), "admin", cfg.Admin.Bind)
+	logger.Info("udpshunt started", "version", version, "listeners", len(cfg.Listeners), "admin", cfg.Admin.Bind)
 
 	<-ctx.Done()
 	logger.Info("shutting down")
