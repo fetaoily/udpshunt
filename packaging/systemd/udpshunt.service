@@ -1,0 +1,26 @@
+[Unit]
+Description=udpshunt UDP load balancer
+Documentation=https://github.com/fetaoily/udpshunt
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/udpshunt -c /etc/udpshunt.yaml
+Restart=always
+RestartSec=5
+# Binding low ports (e.g. :53) without running as root:
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=
+# Spec §10: the daemon owns no persistent state, so a private /tmp and
+# read-only filesystem are safe.
+PrivateTmp=true
+User=nobody
+Group=nobody
+
+[Install]
+WantedBy=multi-user.target
