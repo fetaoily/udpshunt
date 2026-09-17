@@ -61,6 +61,17 @@ Then open <http://127.0.0.1:9155/ui/> — the embedded dashboard, no extra
 files needed. The example config binds `127.0.0.1:19000` and round-robins to
 `127.0.0.1:19001` and `127.0.0.1:19002`.
 
+The example also runs an active health check (`raw` mode: send `"ping"`,
+expect any reply within 1s), so the backends only show UP once something
+answers. Ship the bundled echo backend for that — one instance per backend:
+
+    go run ./examples/echo -addr 127.0.0.1:19001
+    go run ./examples/echo -addr 127.0.0.1:19002
+
+If your real backends do not reply to unknown payloads, set
+`health_check.mode: none` in the config (passive health only) or change
+`health_check.payload` to a valid request for your protocol.
+
 ## Configuration
 
 `udpshunt -c /etc/udpshunt.yaml` loads a YAML config (see
