@@ -1,0 +1,71 @@
+{
+  "title": "udpshunt",
+  "uid": "udpshunt-overview",
+  "tags": ["udpshunt"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus",
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Packets in /s by listener",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [ { "expr": "sum by (listener) (rate(udpshunt_packets_in_total[1m]))", "legendFormat": "{{listener}}" } ]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Packets out /s by listener",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [ { "expr": "sum by (listener) (rate(udpshunt_packets_out_total[1m]))", "legendFormat": "{{listener}}" } ]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Throughput in (bytes/s)",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [ { "expr": "sum by (listener) (rate(udpshunt_bytes_in_total[1m]))", "legendFormat": "{{listener}}" } ]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Throughput out (bytes/s)",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [ { "expr": "sum by (listener) (rate(udpshunt_bytes_out_total[1m]))", "legendFormat": "{{listener}}" } ]
+    },
+    {
+      "id": 5, "type": "stat", "title": "Active sessions",
+      "gridPos": { "x": 0, "y": 16, "w": 6, "h": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [ { "expr": "udpshunt_sessions_active" } ]
+    },
+    {
+      "id": 6, "type": "stat", "title": "Rejected sessions",
+      "gridPos": { "x": 6, "y": 16, "w": 6, "h": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [ { "expr": "udpshunt_sessions_rejected_total" } ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Backend health (1=up)",
+      "gridPos": { "x": 12, "y": 16, "w": 6, "h": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [ { "expr": "udpshunt_backend_healthy", "legendFormat": "{{listener}}/{{backend}}" } ]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Backend errors /s",
+      "gridPos": { "x": 18, "y": 16, "w": 6, "h": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [ { "expr": "sum by (listener, backend) (rate(udpshunt_backend_errors_total[5m]))", "legendFormat": "{{listener}}/{{backend}}" } ]
+    }
+  ]
+}

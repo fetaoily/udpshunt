@@ -1,23 +1,78 @@
 # udpshunt
 
-A high-performance UDP layer-4 load balancer and port forwarder written in Go.
+udpshunt is a high-performance UDP layer-4 load balancer and port forwarder
+written in Go. It binds UDP listeners and relays datagrams to a pool of
+backends as a full proxy: clients are terminated at udpshunt, which
+re-originates traffic from its own sockets and tracks per-client sessions with
+idle timeouts. It ships round-robin, least-sessions and source-hash balancing,
+optional active health checks, hot config reload, and Prometheus metrics —
+plus an embedded web dashboard served from the binary (`/ui` on the admin
+port) and a terminal dashboard (`udpshunt tui`).
 
-Status: M4 (monitoring frontends: `udpshunt tui`, the embedded web UI at `/ui`, per-listener rate history). Design: `docs/superpowers/specs/2026-09-15-udpshunt-design.md`
+Status: M5 complete (M1 core, M2 production, M3 performance, M4 monitoring, M5 delivery). Spec §11 closed; the first v* tag runs the release pipeline.
 
-## Build
+## Install
+
+The config file location depends on how you install — each method below names
+its own path.
+
+### From release archives
+
+Pushing a `v*` tag runs the release workflow (goreleaser), which publishes
+`udpshunt_<version>_<os>_<arch>.tar.gz` archives (`.zip` for windows) plus a
+`checksums.txt` to the release page. Unpack and run the binary with `-c`
+pointing at your config file; the flag defaults to `/etc/udpshunt.yaml`.
+
+### From source
 
     go build -o udpshunt ./cmd/udpshunt
 
-## Run
+### Docker
 
-    udpshunt -c /etc/udpshunt.yaml
+    docker build -t udpshunt .
+    docker run -v $PWD/udpshunt.yaml:/etc/udpshunt/udpshunt.yaml -p 53:53/udp -p 9155:9155/tcp udpshunt
 
-See `examples/basic.yaml` for the config format: listeners bind a UDP port and
-forward traffic to a pool of backends. Sessions idle out after
-`session_timeout` (default 60s, capped by `sessions.max` when set). SIGTERM/SIGINT
-triggers a graceful drain.
+The image expects the config at `/etc/udpshunt/udpshunt.yaml` (its `CMD`
+default). Mounting under the `/etc/udpshunt/` directory — the single file as
+shown, or the whole directory with `-v $PWD/conf:/etc/udpshunt:ro` — keeps
+host-side config replacement visible to the container, whereas bind-mounting a
+single file at a fixed path goes stale when an editor replaces the file (new
+inode). The admin port has no built-in authentication (see
+[Admin API](#admin-api)), so publish `9155/tcp` only where that is acceptable.
 
-## Balancing modes
+### systemd
+
+    sudo cp udpshunt /usr/local/bin/
+    sudo cp packaging/systemd/udpshunt.service /etc/systemd/system/
+    sudo systemctl enable --now udpshunt
+
+The unit expects the binary at `/usr/local/bin/udpshunt` and the config at the
+flat single-file path `/etc/udpshunt.yaml` (its `ExecStart` is
+`/usr/local/bin/udpshunt -c /etc/udpshunt.yaml`). It runs as `nobody` with
+`Restart=always` and `CAP_NET_BIND_SERVICE`, so listeners on low ports (e.g.
+`:53`) work without root.
+
+## Quick start
+
+    go build -o udpshunt ./cmd/udpshunt
+    ./udpshunt -c examples/basic.yaml
+
+Then open <http://127.0.0.1:9155/ui/> — the embedded dashboard, no extra
+files needed. The example config binds `127.0.0.1:19000` and round-robins to
+`127.0.0.1:19001` and `127.0.0.1:19002`.
+
+## Configuration
+
+`udpshunt -c /etc/udpshunt.yaml` loads a YAML config (see
+`examples/basic.yaml`): listeners bind a UDP port and forward traffic to a
+pool of backends. Sessions idle out after `session_timeout` (default 60s,
+inherited from `sessions.timeout`); the live-session count is capped by
+`sessions.max` when set (`0`, the default, means unlimited). SIGTERM/SIGINT
+triggers a graceful drain. Top-level keys: `listeners`, `sessions` (`timeout`,
+`max`), `logging` (`level`: debug|info|warn|error, default info; `format`:
+json|text, default json), `admin` (`bind`, default `127.0.0.1:9155`).
+
+### Balancing modes
 
 `balance` selects how new sessions pick a backend:
 
@@ -25,7 +80,7 @@ triggers a graceful drain.
 - `least_sessions` — backend with the fewest live sessions; ties keep the earliest backend in stable pool order.
 - `source_hash` — stable rendezvous hash of the client IP, so a client keeps its backend as long as it stays healthy; when no backend is healthy it fails open via the same rendezvous hash over all backends.
 
-## Listener socket buffer
+### Listener socket buffer
 
 `read_buffer` sets the kernel receive buffer (`SO_RCVBUF`, in bytes) on the
 listener socket. `0` (the default) requests 4 MiB, comfortably above the OS
@@ -42,7 +97,7 @@ listeners:
 The request is best-effort: if the kernel refuses (for example a low
 `net.core.rmem_max`), udpshunt logs a warning and keeps the socket.
 
-## Health checks
+### Health checks
 
 Optional `health_check` block per listener enables active probing:
 
@@ -63,6 +118,15 @@ closed; with active checks on, recovery requires `rise` consecutive successes,
 otherwise a passive cooldown applies. A failed config reload never changes
 what is running.
 
+### Hot reload
+
+Both `kill -HUP <pid>` (not delivered on Windows) and
+`curl -X POST http://127.0.0.1:9155/reload` re-read the `-c` file. Listeners
+are diffed against the running set: removed listeners stop, a `bind` change
+restarts the socket, everything else (backends, balance mode, session
+timeout, health checks) updates live. On any error the previous config keeps
+serving.
+
 ## Admin API
 
 `admin.bind` serves four routes:
@@ -72,7 +136,32 @@ what is running.
 - `POST /reload` — reload the config file and apply it.
 - `GET /ui` — the embedded web dashboard (below).
 
-## Terminal dashboard
+## Monitoring
+
+### Metric families
+
+Scrape `GET /metrics` on the admin port. Families:
+`udpshunt_packets_in_total`, `udpshunt_bytes_in_total`,
+`udpshunt_packets_out_total`, `udpshunt_bytes_out_total` (label `listener`);
+`udpshunt_backend_packets_in_total`, `udpshunt_backend_packets_out_total`,
+`udpshunt_backend_errors_total`, `udpshunt_backend_healthy`,
+`udpshunt_backend_state_changes_total` (labels `listener`, `backend`);
+`udpshunt_sessions_created_total` (label `listener`),
+`udpshunt_sessions_expired_total`, `udpshunt_sessions_rejected_total`,
+`udpshunt_sessions_active`; `udpshunt_reloads_total`,
+`udpshunt_reload_failures_total`, `udpshunt_uptime_seconds`.
+
+### Grafana
+
+Import `deploy/grafana-dashboard.json` (Dashboards -> New -> Import) and pick
+your Prometheus datasource when prompted — the dashboard defines a
+`DS_PROMETHEUS` datasource variable for that choice. Eight panels cover packet
+and byte throughput, active/rejected sessions, backend health and backend
+errors. The data source is the admin port's `/metrics` endpoint, e.g. a scrape
+job with `targets: ["127.0.0.1:9155"]` (`metrics_path` defaults to
+`/metrics`).
+
+### Terminal dashboard
 
 `udpshunt tui` renders a live dashboard (uptime, totals, per-listener
 sparklines, backend health, recent events) from a running udpshunt's admin
@@ -85,7 +174,7 @@ API — the daemon itself must already be running:
 
 Press `q` or Ctrl-C to quit.
 
-## Web UI
+### Web UI
 
 The admin API also serves a single-page dashboard at `/ui` on the same port
 (uptime and totals, per-listener rate charts, backend health, recent events;
@@ -97,35 +186,6 @@ There is no built-in authentication on the admin port (design assumption C):
 `/ui`, `/status` and `/metrics` are open to anyone who can reach it. Keep
 `admin.bind` on loopback (the default `127.0.0.1:9155`) or put the port
 behind an authenticating proxy before exposing it.
-
-To rebuild it after changing `web/src`, run from the repo root (requires
-node >= 20 and npm):
-
-    sh web/build.sh
-
-That runs `npm ci && npm run build` in `web/` and copies `dist/` into
-`internal/webui/dist`. For iteration with live reload, `npm run dev` in `web/`
-starts vite (dev-only proxy to `http://127.0.0.1:9155` for `/status` and
-`/metrics`).
-
-## Hot reload
-
-Both `kill -HUP <pid>` (not delivered on Windows) and
-`curl -X POST http://127.0.0.1:9155/reload` re-read the `-c` file. Listeners
-are diffed against the running set: removed listeners stop, a `bind` change
-restarts the socket, everything else (backends, balance mode, session
-timeout, health checks) updates live. On any error the previous config keeps
-serving.
-
-Metric families: `udpshunt_packets_in_total`, `udpshunt_bytes_in_total`,
-`udpshunt_packets_out_total`, `udpshunt_bytes_out_total` (label `listener`);
-`udpshunt_backend_packets_in_total`, `udpshunt_backend_packets_out_total`,
-`udpshunt_backend_errors_total`, `udpshunt_backend_healthy`,
-`udpshunt_backend_state_changes_total` (labels `listener`, `backend`);
-`udpshunt_sessions_created_total` (label `listener`),
-`udpshunt_sessions_expired_total`, `udpshunt_sessions_rejected_total`,
-`udpshunt_sessions_active`; `udpshunt_reloads_total`,
-`udpshunt_reload_failures_total`, `udpshunt_uptime_seconds`.
 
 ## Memory tuning
 
@@ -151,9 +211,26 @@ on Linux, single-packet reads as the portable fallback.
     go test ./internal/pktio/ -bench . -benchtime 2s -run '^$'
 
 Measured numbers, the spec-target gap analysis and the SO_REUSEPORT
-deferral live in `docs/benchmarks.md`. Pair benchmark runs with the
-`GOMEMLIMIT` guidance above.
+deferral live in `docs/benchmarks.md`. The `recvmmsg` rows there read
+"pending CI bench run" until the first manual `bench` job of the `ci`
+workflow fills them — the dev box cannot exercise the Linux batch path. Pair
+benchmark runs with the `GOMEMLIMIT` guidance above.
 
 ## Development
 
+    go build -o udpshunt ./cmd/udpshunt
     go test ./...
+
+The Grafana dashboard in `deploy/` is import-checked by `go test ./deploy/`
+(valid JSON, all metric families referenced, datasource variable defined).
+To rebuild the web UI after changing `web/src`, run from the repo root
+(requires node >= 20 and npm):
+
+    sh web/build.sh
+
+That runs `npm ci && npm run build` in `web/` and copies `dist/` into
+`internal/webui/dist`. For iteration with live reload, `npm run dev` in `web/`
+starts vite (dev-only proxy to `http://127.0.0.1:9155` for `/status` and
+`/metrics`).
+
+Design doc: `docs/superpowers/specs/2026-09-15-udpshunt-design.md`.
