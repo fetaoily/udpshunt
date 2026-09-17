@@ -98,6 +98,20 @@ If your real backends do not reply to unknown payloads, set
 `health_check.mode: none` in the config (passive health only) or change
 `health_check.payload` to a valid request for your protocol.
 
+### Send a test request
+
+Bash's built-in `/dev/udp` needs nothing installed — each redirection uses a
+fresh source port, like a new client:
+
+    echo "hello-$(date +%s)" > /dev/udp/127.0.0.1/19000
+
+    for i in $(seq 1 20); do echo "req-$i" > /dev/udp/127.0.0.1/19000; sleep 0.2; done
+
+Watch the requests land in the per-request log (the dashboard and
+`/status` update live too):
+
+    tail -f /var/log/udpshunt/udpshunt-requests-$(date +%F).log
+
 ## Configuration
 
 `udpshunt -c /etc/udpshunt/udpshunt.yaml` loads a YAML config (see
