@@ -262,3 +262,71 @@ func TestM3ValidationErrors(t *testing.T) {
 		})
 	}
 }
+
+const baseListener = `
+listeners:
+  - name: a
+    bind: 127.0.0.1:19000
+    backends: [127.0.0.1:19001]
+`
+
+func TestRequestLogDefaultsEnabled(t *testing.T) {
+	c, err := Load(writeConfig(t, baseListener))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.RequestLog.IsEnabled() {
+		t.Fatal("request log must default to enabled")
+	}
+	if c.RequestLog.RetentionDays != 30 {
+		t.Fatalf("default retention_days = %d, want 30", c.RequestLog.RetentionDays)
+	}
+	if c.RequestLog.Dir == "" {
+		t.Fatal("default dir must not be empty")
+	}
+}
+
+func TestRequestLogExplicitDisable(t *testing.T) {
+	c, err := Load(writeConfig(t, baseListener+"request_log:\n  enabled: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RequestLog.IsEnabled() {
+		t.Fatal("enabled: false must disable request logging")
+	}
+}
+
+func TestRequestLogExplicitSettings(t *testing.T) {
+	c, err := Load(writeConfig(t, baseListener+`
+request_log:
+  enabled: true
+  dir: /tmp/rl
+  retention_days: 7
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.RequestLog.IsEnabled() || c.RequestLog.Dir != "/tmp/rl" || c.RequestLog.RetentionDays != 7 {
+		t.Fatalf("bad request_log: %+v", c.RequestLog)
+	}
+}
+
+func TestRequestLogValidationErrors(t *testing.T) {
+	cases := map[string]string{
+		// retention_days: 0 cannot be distinguished from "unset" with a
+		// plain int, so it normalizes to the default (30); only negatives
+		// are rejected.
+		"negative retention": baseListener + "request_log:\n  retention_days: -3\n",
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, yaml))
+			if err == nil {
+				t.Fatalf("expected error for %s", name)
+			}
+			if !strings.HasPrefix(err.Error(), "invalid config: ") {
+				t.Fatalf("error for %s did not come from Validate: %v", name, err)
+			}
+		})
+	}
+}

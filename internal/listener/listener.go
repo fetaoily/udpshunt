@@ -15,6 +15,7 @@ import (
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/metrics"
 	"github.com/fetaoily/udpshunt/internal/pktio"
+	"github.com/fetaoily/udpshunt/internal/requestlog"
 	"github.com/fetaoily/udpshunt/internal/session"
 )
 
@@ -29,6 +30,7 @@ type Listener struct {
 	bal      *balancer.Balancer
 	mgr      *session.Manager
 	met      *metrics.ListenerMetrics
+	reqLog   *requestlog.Logger
 	timeout  time.Duration
 	logger   *slog.Logger
 	resolved map[string]*net.UDPAddr // backend address -> pre-resolved address
@@ -43,8 +45,9 @@ type Listener struct {
 
 // New binds the frontend UDP socket described by cfg.Bind and resolves every
 // backend address once so the receive loop never pays for DNS on new sessions.
-// met may be nil to run without metrics.
-func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.Manager, logger *slog.Logger, met *metrics.ListenerMetrics) (*Listener, error) {
+// met may be nil to run without metrics; reqLog may be nil to run without
+// the per-request file log.
+func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.Manager, logger *slog.Logger, met *metrics.ListenerMetrics, reqLog *requestlog.Logger) (*Listener, error) {
 	addr, err := net.ResolveUDPAddr("udp", cfg.Bind)
 	if err != nil {
 		return nil, err
@@ -76,6 +79,7 @@ func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.
 		bal:      bal,
 		mgr:      mgr,
 		met:      met,
+		reqLog:   reqLog,
 		timeout:  time.Duration(cfg.SessionTimeout),
 		logger:   logger.With("listener", name),
 		resolved: resolved,
@@ -149,13 +153,31 @@ func (l *Listener) Run(ctx context.Context) error {
 }
 
 // handle routes one client packet: find or create the session, then forward
-// to the session's backend.
+// to the session's backend. Every packet lands in the request log with its
+// outcome (the log swallows nothing on the hot path: Record never blocks).
 func (l *Listener) handle(client *net.UDPAddr, pkt []byte) {
+	backend, outcome := l.forward(client, pkt)
+	if l.reqLog != nil {
+		l.reqLog.Record(requestlog.Entry{
+			Time:     time.Now(),
+			Listener: l.name,
+			Client:   client.String(),
+			Backend:  backend,
+			Bytes:    len(pkt),
+			Outcome:  outcome,
+		})
+	}
+}
+
+// forward sends one client packet to its session's backend and reports the
+// backend involved ("" when none was selected) and the outcome.
+func (l *Listener) forward(client *net.UDPAddr, pkt []byte) (backend, outcome string) {
 	s := l.mgr.Get(l.name, client)
 	if s == nil {
-		s = l.createSession(client)
+		var err string
+		s, err = l.createSession(client)
 		if s == nil {
-			return
+			return "", err
 		}
 	}
 	s.Touch()
@@ -163,24 +185,26 @@ func (l *Listener) handle(client *net.UDPAddr, pkt []byte) {
 		l.met.BackendError(s.Backend)
 		l.bal.ReportError(s.Backend)
 		l.mgr.Remove(l.name, client)
-		return
+		return s.Backend, requestlog.OutcomeUpstreamError
 	}
 	l.met.BackendIn(s.Backend, 1)
 	// No ReportSuccess here: a locally successful UDP write says nothing
 	// about backend liveness; only a relayed reply (downstream) is a
 	// liveness signal.
+	return s.Backend, requestlog.OutcomeForwarded
 }
 
 // createSession picks a backend, dials the upstream socket and starts the
-// downstream relay goroutine. It returns nil when the session could not be
-// established or stored.
-func (l *Listener) createSession(client *net.UDPAddr) *session.Session {
+// downstream relay goroutine. It returns a nil session when one could not
+// be established or stored, together with the outcome describing why
+// (requestlog.OutcomeNoBackend / OutcomeRejected / OutcomeUpstreamError).
+func (l *Listener) createSession(client *net.UDPAddr) (*session.Session, string) {
 	l.mu.Lock()
 	timeout := l.timeout
 	l.mu.Unlock()
 	backendAddr := l.bal.Pick(client.IP.String())
 	if backendAddr == "" {
-		return nil
+		return nil, requestlog.OutcomeNoBackend
 	}
 	raddr, ok := l.resolved[backendAddr]
 	if !ok {
@@ -190,7 +214,7 @@ func (l *Listener) createSession(client *net.UDPAddr) *session.Session {
 		raddr, err = net.ResolveUDPAddr("udp", backendAddr)
 		if err != nil {
 			l.logger.Error("unresolvable backend address", "backend", backendAddr, "err", err)
-			return nil
+			return nil, requestlog.OutcomeUpstreamError
 		}
 		l.logger.Error("backend address missing from startup resolution, resolved on demand", "backend", backendAddr)
 		l.resolved[backendAddr] = raddr
@@ -199,21 +223,21 @@ func (l *Listener) createSession(client *net.UDPAddr) *session.Session {
 	if err != nil {
 		l.bal.ReportError(backendAddr)
 		l.logger.Warn("dial upstream failed", "backend", backendAddr, "err", err)
-		return nil
+		return nil, requestlog.OutcomeUpstreamError
 	}
 	s := session.NewSession(l.name, client, backendAddr, up, timeout)
 	if !l.mgr.Put(l.name, client, s) {
 		s.Close()
 		l.logger.Debug("session rejected (cap or duplicate), dropping packet", "client", client)
-		return nil
+		return nil, requestlog.OutcomeRejected
 	}
 	if !l.startDownstream(s) {
 		l.mgr.Remove(l.name, client)
-		return nil
+		return nil, requestlog.OutcomeUpstreamError
 	}
 	l.met.SessionCreated()
 	l.logger.Debug("session created", "client", client, "backend", backendAddr)
-	return s
+	return s, ""
 }
 
 // startDownstream spawns the downstream relay for s. The stopped check and

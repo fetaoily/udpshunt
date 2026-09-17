@@ -19,6 +19,11 @@ ReadWritePaths=
 # Spec §10: the daemon owns no persistent state, so a private /tmp and
 # read-only filesystem are safe.
 PrivateTmp=true
+# The per-request log (request_log.dir default /var/log/udpshunt): created
+# and chowned to User= at start; also exempt from ProtectSystem=strict.
+# Ignored by systemd < 240 — udpshunt then logs a warning and runs without
+# the request log.
+LogsDirectory=udpshunt
 User=nobody
 
 [Install]

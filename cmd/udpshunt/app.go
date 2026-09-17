@@ -14,6 +14,7 @@ import (
 	"github.com/fetaoily/udpshunt/internal/listener"
 	"github.com/fetaoily/udpshunt/internal/metrics"
 	"github.com/fetaoily/udpshunt/internal/rates"
+	"github.com/fetaoily/udpshunt/internal/requestlog"
 	"github.com/fetaoily/udpshunt/internal/session"
 )
 
@@ -26,6 +27,7 @@ type App struct {
 	mgr     *session.Manager
 	events  *admin.Recorder
 	rates   *rates.Collector
+	reqLog  *requestlog.Logger
 
 	mu        sync.Mutex
 	cfg       config.Config
@@ -133,7 +135,7 @@ func (a *App) startListenerLocked(ctx context.Context, lc config.Listener) error
 		a.events.Add("backend_down", fmt.Sprintf("%s %s closed=%d", lc.Name, addr, n))
 		a.logger.Info("backend marked down, sessions closed", "listener", lc.Name, "backend", addr, "sessions", n)
 	})
-	l, err := listener.New(lc.Name, lc, bal, a.mgr, a.logger, a.met.ForListener(lc.Name))
+	l, err := listener.New(lc.Name, lc, bal, a.mgr, a.logger, a.met.ForListener(lc.Name), a.reqLog)
 	if err != nil {
 		return err
 	}
@@ -274,6 +276,13 @@ func (a *App) Status() admin.Status {
 			Rejected: a.mgr.Rejected(),
 		},
 		Events: a.events.List(),
+	}
+	if a.reqLog != nil {
+		st.RequestLog = &admin.RequestLogStatus{
+			Enabled: a.reqLog.Enabled(),
+			Dir:     a.reqLog.Dir(),
+			Dropped: a.reqLog.Dropped(),
+		}
 	}
 	for _, lc := range a.cfg.Listeners {
 		bal := a.balancers[lc.Name]

@@ -15,6 +15,7 @@ import (
 
 	"github.com/fetaoily/udpshunt/internal/admin"
 	"github.com/fetaoily/udpshunt/internal/config"
+	"github.com/fetaoily/udpshunt/internal/requestlog"
 	"github.com/fetaoily/udpshunt/internal/tui"
 	"github.com/fetaoily/udpshunt/internal/webui"
 )
@@ -76,6 +77,17 @@ func run() error {
 	defer stop()
 
 	app := NewApp(opts.cfgPath, logger)
+	// The request log is created once and survives reloads: moving it per
+	// reload would rotate files mid-day for a config tweak. A disabled
+	// config leaves it nil so the hot path pays nothing.
+	if cfg.RequestLog.IsEnabled() {
+		app.reqLog = requestlog.New(requestlog.Options{
+			Dir:           cfg.RequestLog.Dir,
+			RetentionDays: cfg.RequestLog.RetentionDays,
+			Logger:        logger,
+		})
+		defer app.reqLog.Stop()
+	}
 	app.met.SetStartedAt(time.Now())
 	app.met.SetSessionStats(app.mgr.Created, app.mgr.Expired, app.mgr.Rejected,
 		func() int64 { return int64(app.mgr.Count()) })

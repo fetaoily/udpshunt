@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -30,10 +32,11 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type Config struct {
-	Listeners []Listener `yaml:"listeners"`
-	Sessions  Sessions   `yaml:"sessions"`
-	Logging   Logging    `yaml:"logging"`
-	Admin     Admin      `yaml:"admin"`
+	Listeners  []Listener `yaml:"listeners"`
+	Sessions   Sessions   `yaml:"sessions"`
+	Logging    Logging    `yaml:"logging"`
+	Admin      Admin      `yaml:"admin"`
+	RequestLog RequestLog `yaml:"request_log"`
 }
 
 type Listener struct {
@@ -68,6 +71,19 @@ type HealthCheck struct {
 type Admin struct {
 	Bind string `yaml:"bind"`
 }
+
+// RequestLog configures the per-request file log: one JSON line per client
+// packet, a file per day, gzip on rollover, age-based retention. Enabled
+// by default; set enabled: false to turn it off.
+type RequestLog struct {
+	// Enabled is a pointer so an absent key means the default (true).
+	Enabled       *bool  `yaml:"enabled"`
+	Dir           string `yaml:"dir"`
+	RetentionDays int    `yaml:"retention_days"`
+}
+
+// IsEnabled reports whether request logging is on.
+func (r RequestLog) IsEnabled() bool { return r.Enabled != nil && *r.Enabled }
 
 // Load reads the YAML file at path, applies defaults, and validates the result.
 func Load(path string) (Config, error) {
@@ -122,6 +138,29 @@ func applyDefaults(c *Config) {
 	if c.Admin.Bind == "" {
 		c.Admin.Bind = "127.0.0.1:9155"
 	}
+	if c.RequestLog.Enabled == nil {
+		enabled := true
+		c.RequestLog.Enabled = &enabled
+	}
+	if c.RequestLog.Dir == "" {
+		c.RequestLog.Dir = defaultRequestLogDir()
+	}
+	if c.RequestLog.RetentionDays == 0 {
+		c.RequestLog.RetentionDays = 30
+	}
+}
+
+// defaultRequestLogDir returns the platform's conventional service log
+// directory: /var/log/udpshunt on Unix, the per-machine program-data path
+// on Windows.
+func defaultRequestLogDir() string {
+	if runtime.GOOS == "windows" {
+		if pd := os.Getenv("ProgramData"); pd != "" {
+			return filepath.Join(pd, "udpshunt", "logs")
+		}
+		return "logs"
+	}
+	return "/var/log/udpshunt"
 }
 
 func (c Config) Validate() error {
@@ -203,6 +242,9 @@ func (c Config) Validate() error {
 	}
 	if _, err := net.ResolveUDPAddr("udp", c.Admin.Bind); err != nil {
 		return fmt.Errorf("admin.bind: invalid address %q: %w", c.Admin.Bind, err)
+	}
+	if c.RequestLog.IsEnabled() && c.RequestLog.RetentionDays < 1 {
+		return fmt.Errorf("request_log.retention_days must be >= 1 when request logging is enabled")
 	}
 	switch c.Logging.Level {
 	case "debug", "info", "warn", "error":

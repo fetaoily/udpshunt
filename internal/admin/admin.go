@@ -55,10 +55,18 @@ func (r *Recorder) List() []Event {
 
 // Status is the JSON shape of GET /status (spec §8).
 type Status struct {
-	Uptime    string           `json:"uptime"`
-	Listeners []ListenerStatus `json:"listeners"`
-	Sessions  SessionsStatus   `json:"sessions"`
-	Events    []Event          `json:"events"`
+	Uptime     string            `json:"uptime"`
+	Listeners  []ListenerStatus  `json:"listeners"`
+	Sessions   SessionsStatus    `json:"sessions"`
+	RequestLog *RequestLogStatus `json:"request_log,omitempty"`
+	Events     []Event           `json:"events"`
+}
+
+// RequestLogStatus is the /status view of the per-request file log.
+type RequestLogStatus struct {
+	Enabled bool   `json:"enabled"`
+	Dir     string `json:"dir,omitempty"`
+	Dropped int64  `json:"dropped"`
 }
 
 type ListenerStatus struct {

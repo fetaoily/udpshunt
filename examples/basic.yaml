@@ -22,3 +22,9 @@ admin:
 logging:
   level: debug
   format: text
+
+# Per-request log (defaults shown; the section may be omitted entirely).
+request_log:
+  enabled: true
+  dir: /var/log/udpshunt
+  retention_days: 30

@@ -21,6 +21,14 @@ sessions:
 admin:
   bind: 127.0.0.1:9155
 
+# Per-request log: one JSON line per client packet, one file per day,
+# gzip on rollover, files older than retention_days deleted.
+# Defaults when the section is absent: enabled, /var/log/udpshunt, 30 days.
+request_log:
+  enabled: true
+  dir: /var/log/udpshunt
+  retention_days: 30
+
 logging:
   level: info
   format: text

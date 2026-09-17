@@ -107,7 +107,44 @@ inherited from `sessions.timeout`); the live-session count is capped by
 `sessions.max` when set (`0`, the default, means unlimited). SIGTERM/SIGINT
 triggers a graceful drain. Top-level keys: `listeners`, `sessions` (`timeout`,
 `max`), `logging` (`level`: debug|info|warn|error, default info; `format`:
-json|text, default json), `admin` (`bind`, default `127.0.0.1:9155`).
+json|text, default json), `admin` (`bind`, default `127.0.0.1:9155`),
+`request_log` (below).
+
+### Request log
+
+`request_log` writes one JSON line per client packet to a file per day.
+It is **enabled by default**; set `enabled: false` to turn it off:
+
+```yaml
+request_log:
+  enabled: true
+  dir: /var/log/udpshunt   # default: /var/log/udpshunt on Unix,
+                           # %ProgramData%\udpshunt\logs on Windows
+  retention_days: 30       # files older than this are deleted
+```
+
+Each line records the packet with its outcome:
+
+```json
+{"time":"2026-09-17T14:30:05.123+08:00","listener":"dns-in","client":"203.0.113.7:51820","backend":"10.0.0.1:53","bytes":74,"outcome":"forwarded"}
+```
+
+`outcome` is one of `forwarded`, `no_backend` (empty backend pool),
+`rejected` (session cap reached) or `upstream_error` (dial or write to the
+backend failed). At day rollover the previous day's file is gzip-compressed
+in the background (`*.log.gz`); files older than `retention_days` are
+deleted at startup and once per day. The log never slows the proxy: entries
+go through a bounded in-memory queue, and when the queue fills (disk slower
+than traffic) entries are dropped and counted — the drop total is exposed
+as `request_log.dropped` in `/status`. If the directory cannot be created
+or written, udpshunt logs one warning and keeps running without the log.
+
+Notes per install method: the deb/rpm packages ship the systemd unit with
+`LogsDirectory=udpshunt`, so `/var/log/udpshunt` is created and writable at
+service start (needs systemd ≥ 240; older systemd silently skips it and
+udpshunt falls back to disabled-with-warning). In Docker, mount a volume and
+point `request_log.dir` at it — the default path is not writable by the
+non-root image user.
 
 ### Balancing modes
 
@@ -169,7 +206,7 @@ serving.
 `admin.bind` serves four routes:
 
 - `GET /metrics` — Prometheus text format (private registry, `udpshunt_` prefix).
-- `GET /status` — JSON snapshot: uptime, per-listener backends (health, session counts), session totals, recent events, and per-listener rate history (last 5 min at 1s samples).
+- `GET /status` — JSON snapshot: uptime, per-listener backends (health, session counts), session totals, request-log state (`dropped` counter), recent events, and per-listener rate history (last 5 min at 1s samples).
 - `POST /reload` — reload the config file and apply it.
 - `GET /ui` — the embedded web dashboard (below).
 

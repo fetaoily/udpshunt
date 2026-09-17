@@ -1,15 +1,20 @@
 package listener
 
 import (
+	"bufio"
 	"context"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/fetaoily/udpshunt/internal/balancer"
 	"github.com/fetaoily/udpshunt/internal/config"
+	"github.com/fetaoily/udpshunt/internal/requestlog"
 	"github.com/fetaoily/udpshunt/internal/session"
 )
 
@@ -71,7 +76,7 @@ func newStack(t *testing.T, lc config.Listener, maxSessions int64) (*Listener, *
 	t.Helper()
 	mgr := session.NewManager(maxSessions)
 	bal := balancer.New(lc.Backends, balancer.Options{})
-	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil)
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,4 +143,110 @@ func TestSessionReuseSameUpstreamPort(t *testing.T) {
 	if mgr.Count() != 1 {
 		t.Fatalf("session count = %d, want 1", mgr.Count())
 	}
+}
+
+// waitLines polls the request log file until it holds at least n lines
+// (entries are written asynchronously from the receive loop).
+func waitLines(t *testing.T, path string, n int) []string {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if lines := readLogLines(t, path); len(lines) >= n {
+			return lines
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("request log %s never reached %d lines", path, n)
+	return nil
+}
+
+func readLogLines(t *testing.T, path string) []string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var lines []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	return lines
+}
+
+func TestRequestLogOutcomes(t *testing.T) {
+	dir := t.TempDir()
+	rl := requestlog.New(requestlog.Options{Dir: dir, RetentionDays: 30})
+	t.Cleanup(rl.Stop)
+	// Entries are written asynchronously from the receive loop; the file
+	// accumulates across subtests, so each waits for its cumulative line.
+	logPath := filepath.Join(dir, "udpshunt-requests-"+time.Now().Format("2006-01-02")+".log")
+
+	t.Run("forwarded", func(t *testing.T) {
+		backend := startEcho(t)
+		lc := config.Listener{Name: "rl-ok", Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
+		l, _, _ := newStackWithLog(t, lc, 0, rl)
+		client := testClient(t)
+		if got := roundTrip(t, client, l.Addr(), "hello"); got != "echo:hello" {
+			t.Fatalf("reply = %q", got)
+		}
+		lines := waitLines(t, logPath, 1)
+		last := lines[len(lines)-1]
+		for _, want := range []string{`"listener":"rl-ok"`, `"outcome":"forwarded"`, `"backend":`, `"bytes":5`} {
+			if !strings.Contains(last, want) {
+				t.Fatalf("line %q missing %s", last, want)
+			}
+		}
+	})
+
+	t.Run("no_backend", func(t *testing.T) {
+		// Pick fails open on an all-down pool, so no_backend happens only
+		// with an empty pool (constructed here, bypassing config.Validate).
+		lc := config.Listener{Name: "rl-none", Bind: "127.0.0.1:0", SessionTimeout: config.Duration(time.Minute)}
+		l, _, _ := newStackWithLog(t, lc, 0, rl)
+		client := testClient(t)
+		if _, err := client.WriteToUDP([]byte("x"), l.Addr()); err != nil {
+			t.Fatal(err)
+		}
+		lines := waitLines(t, logPath, 2)
+		if !strings.Contains(lines[len(lines)-1], `"outcome":"no_backend"`) {
+			t.Fatalf("want no_backend outcome, got %s", lines[len(lines)-1])
+		}
+	})
+
+	t.Run("rejected", func(t *testing.T) {
+		backend := startEcho(t)
+		lc := config.Listener{Name: "rl-cap", Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
+		l, _, _ := newStackWithLog(t, lc, 1, rl) // session cap 1
+		a := testClient(t)
+		if got := roundTrip(t, a, l.Addr(), "one"); got != "echo:one" {
+			t.Fatalf("first reply = %q", got)
+		}
+		b := testClient(t)
+		if _, err := b.WriteToUDP([]byte("two"), l.Addr()); err != nil {
+			t.Fatal(err)
+		}
+		lines := waitLines(t, logPath, 3)
+		if !strings.Contains(lines[len(lines)-1], `"outcome":"rejected"`) {
+			t.Fatalf("want rejected outcome, got %s", lines[len(lines)-1])
+		}
+	})
+}
+
+// newStackWithLog is newStack with a request logger attached.
+func newStackWithLog(t *testing.T, lc config.Listener, maxSessions int64, rl *requestlog.Logger) (*Listener, *balancer.Balancer, *session.Manager) {
+	t.Helper()
+	mgr := session.NewManager(maxSessions)
+	bal := balancer.New(lc.Backends, balancer.Options{})
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, rl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { _ = l.Close() })
+	t.Cleanup(func() { mgr.CloseAll() })
+	t.Cleanup(cancel)
+	go func() { _ = l.Run(ctx) }()
+	return l, bal, mgr
 }
