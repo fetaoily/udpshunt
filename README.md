@@ -112,6 +112,22 @@ Watch the requests land in the per-request log (the dashboard and
 
     tail -f /var/log/udpshunt/udpshunt-requests-$(date +%F).log
 
+Lines appear even when no backend answers — those carry
+`"outcome":"upstream_error"`. To see `"outcome":"forwarded"`, give the
+listener a backend that replies: on a source checkout, run the bundled echo
+server (`go run ./examples/echo -addr 127.0.0.1:19001`); on a package
+install, a python3 echo works with nothing extra installed:
+
+    python3 - <<'EOF'
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 19001))
+    print("echo backend on 127.0.0.1:19001")
+    while True:
+        d, a = s.recvfrom(2048)
+        s.sendto(b"echo:" + d, a)
+    EOF
+
 ## Configuration
 
 `udpshunt -c /etc/udpshunt/udpshunt.yaml` loads a YAML config (see
