@@ -39,6 +39,9 @@ nfpms:
       - apk
     ids:
       - udpshunt
+    # Match ExecStart in packaging/systemd/udpshunt.service and the manual
+    # install instructions in the README.
+    bindir: /usr/local/bin
     contents:
       - src: packaging/systemd/udpshunt.service
         dst: /usr/lib/systemd/system/udpshunt.service
