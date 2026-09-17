@@ -30,7 +30,7 @@ pointing at your config file; the flag defaults to `/etc/udpshunt.yaml`.
 ### Docker
 
     docker build -t udpshunt .
-    docker run -v $PWD/udpshunt.yaml:/etc/udpshunt/udpshunt.yaml -p 53:53/udp -p 9155:9155/tcp udpshunt
+    docker run --restart=unless-stopped -v $PWD/udpshunt.yaml:/etc/udpshunt/udpshunt.yaml -p 53:53/udp -p 9155:9155/tcp udpshunt
 
 The image expects the config at `/etc/udpshunt/udpshunt.yaml` (its `CMD`
 default). Mounting under the `/etc/udpshunt/` directory — the single file as

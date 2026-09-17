@@ -11,3 +11,4 @@ go.mod text eol=lf
 go.sum text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
+*.service text eol=lf

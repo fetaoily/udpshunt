@@ -20,7 +20,6 @@ ReadWritePaths=
 # read-only filesystem are safe.
 PrivateTmp=true
 User=nobody
-Group=nobody
 
 [Install]
 WantedBy=multi-user.target
