@@ -17,12 +17,37 @@ The config file lives at `/etc/udpshunt/udpshunt.yaml` for every install
 method — the same path is the `-c` flag default, the systemd unit's
 `ExecStart`, and the Docker image's `CMD`.
 
+### Debian, Ubuntu (deb) and RHEL-family (rpm) and Alpine (apk)
+
+Releases (v0.1.1 and later) ship native packages built by goreleaser/nfpm.
+Download the package for your platform from the release page, then:
+
+    # Debian / Ubuntu
+    sudo apt install ./udpshunt_<version>_amd64.deb
+    # RHEL / CentOS / Fedora
+    sudo dnf install ./udpshunt_<version>_amd64.rpm
+    # Alpine
+    apk add --allow-untrusted ./udpshunt_<version>_amd64.apk
+
+    sudo systemctl enable --now udpshunt
+
+Each package installs the binary at `/usr/bin/udpshunt`, the systemd unit at
+`/usr/lib/systemd/system/udpshunt.service`, and a starter config at
+`/etc/udpshunt/udpshunt.yaml`. The config is a conffile (`%config(noreplace)`
+on rpm): package upgrades never overwrite a config you have edited. Alpine
+ships the systemd unit too, but Alpine itself runs OpenRC — adapt as needed.
+
+### macOS (Homebrew)
+
+Releases also publish a Homebrew formula to the `fetaoily/homebrew-tap` tap:
+
+    brew install fetaoily/tap/udpshunt
+
 ### From release archives
 
-Pushing a `v*` tag runs the release workflow (goreleaser), which publishes
-`udpshunt_<version>_<os>_<arch>.tar.gz` archives (`.zip` for windows) plus a
-`checksums.txt` to the release page. Unpack and run the binary with `-c`
-pointing at your config file; the flag defaults to
+Every release publishes `udpshunt_<version>_<os>_<arch>.tar.gz` archives
+(`.zip` for windows) plus a `checksums.txt`. Unpack and run the binary with
+`-c` pointing at your config file; the flag defaults to
 `/etc/udpshunt/udpshunt.yaml`.
 
 ### From source

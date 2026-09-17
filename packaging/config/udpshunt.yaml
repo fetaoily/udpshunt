@@ -1,0 +1,26 @@
+# Starter config installed to /etc/udpshunt/udpshunt.yaml.
+# Safe demo: loopback only. Replace backends and bind for real use.
+listeners:
+  - name: demo
+    bind: 127.0.0.1:19000
+    backends: [127.0.0.1:19001, 127.0.0.1:19002]
+    balance: round_robin
+    session_timeout: 60s
+    health_check:
+      mode: raw
+      payload: "70696e67" # "ping"
+      interval: 5s
+      timeout: 1s
+      rise: 2
+      fall: 3
+
+sessions:
+  timeout: 60s
+  max: 0
+
+admin:
+  bind: 127.0.0.1:9155
+
+logging:
+  level: info
+  format: text

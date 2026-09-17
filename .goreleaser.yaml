@@ -25,6 +25,38 @@ archives:
       - goos: windows
         formats: [zip]
 
+nfpms:
+  - id: udpshunt
+    package_name: udpshunt
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: udpshunt
+    homepage: https://github.com/fetaoily/udpshunt
+    maintainer: fetaoily
+    description: High-performance UDP layer-4 load balancer and port forwarder
+    formats:
+      - deb
+      - rpm
+      - apk
+    ids:
+      - udpshunt
+    contents:
+      - src: packaging/systemd/udpshunt.service
+        dst: /usr/lib/systemd/system/udpshunt.service
+      - src: packaging/config/udpshunt.yaml
+        dst: /etc/udpshunt/udpshunt.yaml
+        type: config|noreplace
+
+homebrew_casks:
+  - name: udpshunt
+    repository:
+      owner: fetaoily
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    # Not configured? Keep the cask in dist/ instead of failing the release.
+    skip_upload: '{{ not (isEnvSet "TAP_GITHUB_TOKEN") }}'
+    homepage: https://github.com/fetaoily/udpshunt
+    description: High-performance UDP layer-4 load balancer and port forwarder
+
 checksum:
   name_template: checksums.txt
 
