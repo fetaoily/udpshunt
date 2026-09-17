@@ -294,3 +294,18 @@ func TestOnStateChangeBothDirections(t *testing.T) {
 	}
 	t.Fatalf("expected 2 state-change events, got %v", events)
 }
+
+func TestFailOpenAlternatesAcrossAllDownBackends(t *testing.T) {
+	b := New([]string{"a:1", "b:1"}, Options{ActiveChecks: true, Cooldown: time.Hour})
+	for i := 0; i < 3; i++ {
+		b.ReportError("a:1")
+		b.ReportError("b:1")
+	}
+	got := map[string]int{}
+	for i := 0; i < 6; i++ {
+		got[b.Pick("")]++
+	}
+	if got["a:1"] == 0 || got["b:1"] == 0 {
+		t.Fatalf("fail-open pinned to one backend: %v", got)
+	}
+}

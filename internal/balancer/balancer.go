@@ -153,17 +153,22 @@ func (b *Balancer) Pick(clientIP string) string {
 		return ""
 	}
 	o := b.opts.Load()
+	// One cursor advance per Pick: the fail-open pass re-evaluates the SAME
+	// rotation position. Advancing twice (once per pass) pinned even-sized
+	// all-down pools to a single backend — every fail-open start landed on
+	// the same index.
+	start := (b.next.Add(1) - 1) % uint64(len(p.list))
 	var recovered []string
-	addr, ok := b.pick(clientIP, p, o, true, &recovered)
+	addr, ok := b.pick(clientIP, p, o, start, true, &recovered)
 	if !ok {
-		// fail-open: same algorithm ignoring health
-		addr, _ = b.pick(clientIP, p, o, false, &recovered)
+		// fail-open: same algorithm, same rotation start, ignoring health
+		addr, _ = b.pick(clientIP, p, o, start, false, &recovered)
 	}
 	b.fireRecovered(b.onStateFn(), recovered)
 	return addr
 }
 
-func (b *Balancer) pick(clientIP string, p *pool, o *Options, needHealthy bool, recovered *[]string) (string, bool) {
+func (b *Balancer) pick(clientIP string, p *pool, o *Options, start uint64, needHealthy bool, recovered *[]string) (string, bool) {
 	n := uint64(len(p.list))
 	switch o.Balance {
 	case "least_sessions":
@@ -205,7 +210,6 @@ func (b *Balancer) pick(clientIP string, p *pool, o *Options, needHealthy bool, 
 		}
 	}
 	// round_robin (and fallback for empty clientIP)
-	start := (b.next.Add(1) - 1) % n
 	for i := uint64(0); i < n; i++ {
 		be := p.list[(start+i)%n]
 		if !needHealthy || b.usableTrack(be, o, recovered) {
