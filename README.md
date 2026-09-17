@@ -13,15 +13,17 @@ Status: M5 complete (M1 core, M2 production, M3 performance, M4 monitoring, M5 d
 
 ## Install
 
-The config file location depends on how you install — each method below names
-its own path.
+The config file lives at `/etc/udpshunt/udpshunt.yaml` for every install
+method — the same path is the `-c` flag default, the systemd unit's
+`ExecStart`, and the Docker image's `CMD`.
 
 ### From release archives
 
 Pushing a `v*` tag runs the release workflow (goreleaser), which publishes
 `udpshunt_<version>_<os>_<arch>.tar.gz` archives (`.zip` for windows) plus a
 `checksums.txt` to the release page. Unpack and run the binary with `-c`
-pointing at your config file; the flag defaults to `/etc/udpshunt.yaml`.
+pointing at your config file; the flag defaults to
+`/etc/udpshunt/udpshunt.yaml`.
 
 ### From source
 
@@ -32,12 +34,11 @@ pointing at your config file; the flag defaults to `/etc/udpshunt.yaml`.
     docker build -t udpshunt .
     docker run --restart=unless-stopped -v $PWD/udpshunt.yaml:/etc/udpshunt/udpshunt.yaml -p 53:53/udp -p 9155:9155/tcp udpshunt
 
-The image expects the config at `/etc/udpshunt/udpshunt.yaml` (its `CMD`
-default). Mounting under the `/etc/udpshunt/` directory — the single file as
-shown, or the whole directory with `-v $PWD/conf:/etc/udpshunt:ro` — keeps
-host-side config replacement visible to the container, whereas bind-mounting a
-single file at a fixed path goes stale when an editor replaces the file (new
-inode). The admin port has no built-in authentication (see
+Mounting under the `/etc/udpshunt/` directory — the single file as shown, or
+the whole directory with `-v $PWD/conf:/etc/udpshunt:ro` — keeps host-side
+config replacement visible to the container, whereas bind-mounting a single
+file at a fixed path goes stale when an editor replaces the file (new inode).
+The admin port has no built-in authentication (see
 [Admin API](#admin-api)), so publish `9155/tcp` only where that is acceptable.
 
 ### systemd
@@ -46,9 +47,9 @@ inode). The admin port has no built-in authentication (see
     sudo cp packaging/systemd/udpshunt.service /etc/systemd/system/
     sudo systemctl enable --now udpshunt
 
-The unit expects the binary at `/usr/local/bin/udpshunt` and the config at the
-flat single-file path `/etc/udpshunt.yaml` (its `ExecStart` is
-`/usr/local/bin/udpshunt -c /etc/udpshunt.yaml`). It runs as `nobody` with
+The unit expects the binary at `/usr/local/bin/udpshunt` and the config at
+`/etc/udpshunt/udpshunt.yaml` (its `ExecStart` is
+`/usr/local/bin/udpshunt -c /etc/udpshunt/udpshunt.yaml`). It runs as `nobody` with
 `Restart=always` and `CAP_NET_BIND_SERVICE`, so listeners on low ports (e.g.
 `:53`) work without root.
 
@@ -74,7 +75,7 @@ If your real backends do not reply to unknown payloads, set
 
 ## Configuration
 
-`udpshunt -c /etc/udpshunt.yaml` loads a YAML config (see
+`udpshunt -c /etc/udpshunt/udpshunt.yaml` loads a YAML config (see
 `examples/basic.yaml`): listeners bind a UDP port and forward traffic to a
 pool of backends. Sessions idle out after `session_timeout` (default 60s,
 inherited from `sessions.timeout`); the live-session count is capped by

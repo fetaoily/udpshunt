@@ -31,7 +31,7 @@ type cliOptions struct {
 func parseArgs(args []string) (cliOptions, error) {
 	var o cliOptions
 	fs := flag.NewFlagSet("udpshunt", flag.ContinueOnError)
-	fs.StringVar(&o.cfgPath, "c", "/etc/udpshunt.yaml", "path to YAML config file")
+	fs.StringVar(&o.cfgPath, "c", "/etc/udpshunt/udpshunt.yaml", "path to YAML config file")
 	fs.BoolVar(&o.showVersion, "v", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
 		return o, err

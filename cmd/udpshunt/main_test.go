@@ -16,7 +16,7 @@ func TestParseArgsVersionFlag(t *testing.T) {
 	if !o.showVersion {
 		t.Fatal("-v did not set showVersion")
 	}
-	if o.cfgPath != "/etc/udpshunt.yaml" {
+	if o.cfgPath != "/etc/udpshunt/udpshunt.yaml" {
 		t.Fatalf("cfgPath = %q, want default", o.cfgPath)
 	}
 }

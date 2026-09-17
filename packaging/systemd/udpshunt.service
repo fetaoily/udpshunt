@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/udpshunt -c /etc/udpshunt.yaml
+ExecStart=/usr/local/bin/udpshunt -c /etc/udpshunt/udpshunt.yaml
 Restart=always
 RestartSec=5
 # Binding low ports (e.g. :53) without running as root:
