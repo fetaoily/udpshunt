@@ -1,4 +1,5 @@
 /udpshunt
 /udpshunt.exe
+*.exe~
 /dist/
 .idea/
