@@ -128,6 +128,11 @@ install, a python3 echo works with nothing extra installed:
         s.sendto(b"echo:" + d, a)
     EOF
 
+On Windows, run the commands in this section from Git Bash: the `/dev/udp`
+redirection, the send loop and `tail -f` all work there, and
+`go run ./examples/echo` is cross-platform. cmd.exe and PowerShell are not
+covered by these one-liners (the python3 heredoc is POSIX shell syntax).
+
 ## Configuration
 
 `udpshunt -c /etc/udpshunt/udpshunt.yaml` loads a YAML config (see
