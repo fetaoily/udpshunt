@@ -8,11 +8,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/fetaoily/udpshunt/internal/clientstats"
 )
 
 // Event is one entry in the bounded recent-events log.
@@ -69,6 +72,15 @@ type RequestLogStatus struct {
 	Dropped int64  `json:"dropped"`
 }
 
+// ClientsStatus is the JSON shape of GET /clients: the top client IPs by
+// the requested sort column.
+type ClientsStatus struct {
+	Enabled bool              `json:"enabled"`
+	Tracked int64             `json:"tracked"`
+	Evicted int64             `json:"evicted"`
+	Rows    []clientstats.Row `json:"rows"`
+}
+
 type ListenerStatus struct {
 	Name     string          `json:"name"`
 	Bind     string          `json:"bind"`
@@ -105,6 +117,7 @@ type Deps struct {
 	Registry *prometheus.Registry
 	Status   func() Status
 	Reload   func() error
+	Clients  func(sortCol, order string, limit int) ClientsStatus
 	Logger   *slog.Logger
 	UI       http.Handler
 }
@@ -120,6 +133,7 @@ func New(bind string, deps Deps) *Server {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", promhttp.HandlerFor(deps.Registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("GET /status", s.handleStatus)
+	mux.HandleFunc("GET /clients", s.handleClients)
 	mux.HandleFunc("POST /reload", s.handleReload)
 	if deps.UI != nil {
 		ui := http.StripPrefix("/ui", deps.UI)
@@ -139,6 +153,35 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(s.deps.Status()); err != nil {
 		s.deps.Logger.Warn("status encode failed", "err", err)
+	}
+}
+
+// handleClients serves the per-client-IP table: ?sort=<column>&order=
+// asc|desc&limit=<n>. Defaults match the UIs: requests, descending, 200.
+func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	sortCol := q.Get("sort")
+	if sortCol == "" {
+		sortCol = "requests"
+	}
+	order := q.Get("order")
+	if order != "asc" {
+		order = "desc"
+	}
+	limit := 200
+	if v, err := strconv.Atoi(q.Get("limit")); err == nil && v > 0 {
+		limit = v
+	}
+	if limit > 10000 {
+		limit = 10000
+	}
+	w.Header().Set("Content-Type", "application/json")
+	var st ClientsStatus
+	if s.deps.Clients != nil {
+		st = s.deps.Clients(sortCol, order, limit)
+	}
+	if err := json.NewEncoder(w).Encode(st); err != nil {
+		s.deps.Logger.Warn("clients encode failed", "err", err)
 	}
 }
 

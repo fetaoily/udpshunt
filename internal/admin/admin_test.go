@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/fetaoily/udpshunt/internal/clientstats"
 )
 
 func testServer(t *testing.T, reloadErr error) *httptest.Server {
@@ -129,6 +131,83 @@ func TestUIRoute(t *testing.T) {
 	resp3.Body.Close()
 	if resp3.StatusCode != http.StatusNotFound {
 		t.Fatalf("nil UI: GET /ui/ = %d, want 404", resp3.StatusCode)
+	}
+}
+
+func TestClientsEndpoint(t *testing.T) {
+	var gotSort, gotOrder string
+	var gotLimit int
+	s := New("127.0.0.1:0", Deps{
+		Registry: prometheus.NewRegistry(),
+		Status:   func() Status { return Status{} },
+		Reload:   func() error { return nil },
+		Clients: func(sortCol, order string, limit int) ClientsStatus {
+			gotSort, gotOrder, gotLimit = sortCol, order, limit
+			return ClientsStatus{
+				Enabled: true,
+				Tracked: 2,
+				Evicted: 1,
+				Rows: []clientstats.Row{{
+					IP: "10.0.0.1", Requests: 5, Responses: 4,
+					BytesIn: 100, BytesOut: 200, PPSIn: 1.5, LastSeen: 12345,
+				}},
+			}
+		},
+		Logger: slog.Default(),
+	})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/clients?sort=bytes_out&order=asc&limit=50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("clients = %d", resp.StatusCode)
+	}
+	for _, want := range []string{`"enabled":true`, `"tracked":2`, `"evicted":1`, `"ip":"10.0.0.1"`, `"requests":5`, `"pps_in":1.5`} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("clients body missing %q: %s", want, body)
+		}
+	}
+	if gotSort != "bytes_out" || gotOrder != "asc" || gotLimit != 50 {
+		t.Fatalf("params not passed: sort=%q order=%q limit=%d", gotSort, gotOrder, gotLimit)
+	}
+
+	// Defaults: requests, desc, 200.
+	resp2, err := http.Get(ts.URL + "/clients")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if gotSort != "requests" || gotOrder != "desc" || gotLimit != 200 {
+		t.Fatalf("defaults wrong: sort=%q order=%q limit=%d", gotSort, gotOrder, gotLimit)
+	}
+
+	// Limit is clamped.
+	resp3, err := http.Get(ts.URL + "/clients?limit=9999999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if gotLimit != 10000 {
+		t.Fatalf("limit not clamped: %d", gotLimit)
+	}
+
+	// nil Clients must serve the disabled shape, not panic.
+	s2 := New("127.0.0.1:0", Deps{Registry: prometheus.NewRegistry(), Logger: slog.Default()})
+	ts2 := httptest.NewServer(s2.Handler())
+	defer ts2.Close()
+	resp4, err := http.Get(ts2.URL + "/clients")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp4.Body.Close()
+	body4, _ := io.ReadAll(resp4.Body)
+	if !strings.Contains(string(body4), `"enabled":false`) {
+		t.Fatalf("nil Clients must be disabled shape: %s", body4)
 	}
 }
 

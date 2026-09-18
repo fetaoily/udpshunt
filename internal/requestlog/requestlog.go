@@ -9,16 +9,15 @@ package requestlog
 
 import (
 	"bufio"
-	"compress/gzip"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/fetaoily/udpshunt/internal/dailyfile"
 )
 
 // Outcomes recorded per request (mirrors the listener forward path).
@@ -121,8 +120,8 @@ func New(opts Options) *Logger {
 	today := opts.Clock().Format(dayFormat)
 	// Prune first: expired files must be deleted, not swept into fresh
 	// gzip copies. Then compress what a crash left behind.
-	l.prune(today)
-	l.sweepStale(today)
+	dailyfile.Prune(opts.Dir, filePrefix, fileSuffix, today, opts.RetentionDays, l.logger)
+	dailyfile.SweepStale(opts.Dir, filePrefix, fileSuffix, today, l.logger)
 	go l.run()
 	return l
 }
@@ -212,7 +211,9 @@ func (l *Logger) onTick() {
 		l.warn("flush request log failed", "err", err)
 	}
 	if day != l.lastPruneDay {
-		l.prune(day) // prune once per day even with no traffic
+		// Prune once per day even with no traffic.
+		dailyfile.Prune(l.opts.Dir, filePrefix, fileSuffix, day, l.opts.RetentionDays, l.logger)
+		l.lastPruneDay = day
 	}
 }
 
@@ -253,9 +254,10 @@ func (l *Logger) rotateTo(day string) {
 	}
 	l.openDay(day)
 	if old != "" {
-		go compress(old, l.logger)
+		go dailyfile.Compress(old, l.logger)
 	}
-	l.prune(day)
+	dailyfile.Prune(l.opts.Dir, filePrefix, fileSuffix, day, l.opts.RetentionDays, l.logger)
+	l.lastPruneDay = day
 }
 
 func (l *Logger) openDay(day string) error {
@@ -285,117 +287,8 @@ func (l *Logger) closeFile() {
 	l.f, l.w, l.enc = nil, nil, nil
 }
 
-// sweepStale compresses plain files left behind by a crash mid-rotation:
-// anything not from today is no longer being written.
-func (l *Logger) sweepStale(today string) {
-	entries, err := os.ReadDir(l.opts.Dir)
-	if err != nil {
-		return
-	}
-	for _, de := range entries {
-		name := de.Name()
-		if !strings.HasPrefix(name, filePrefix) || !strings.HasSuffix(name, fileSuffix) {
-			continue
-		}
-		day := strings.TrimSuffix(strings.TrimPrefix(name, filePrefix), fileSuffix)
-		if _, err := time.ParseInLocation(dayFormat, day, time.Local); err != nil || day == today {
-			continue
-		}
-		go compress(filepath.Join(l.opts.Dir, name), l.logger)
-	}
-}
-
-// prune deletes request log files (plain and gzipped) whose day is older
-// than the retention window. A file per day turns retention into plain
-// deletion: no merging, no rewriting.
-func (l *Logger) prune(today string) {
-	l.lastPruneDay = today
-	entries, err := os.ReadDir(l.opts.Dir)
-	if err != nil {
-		return
-	}
-	cutoff, err := time.ParseInLocation(dayFormat, today, time.Local)
-	if err != nil {
-		return
-	}
-	cutoff = cutoff.AddDate(0, 0, -l.opts.RetentionDays)
-	for _, de := range entries {
-		name := de.Name()
-		if !strings.HasPrefix(name, filePrefix) {
-			continue
-		}
-		day := strings.TrimPrefix(name, filePrefix)
-		day = strings.TrimSuffix(day, gzipSuffix)
-		day = strings.TrimSuffix(day, fileSuffix)
-		t, err := time.ParseInLocation(dayFormat, day, time.Local)
-		if err != nil {
-			continue
-		}
-		if t.Before(cutoff) {
-			if err := os.Remove(filepath.Join(l.opts.Dir, name)); err != nil {
-				l.warn("prune request log failed", "file", name, "err", err)
-			}
-		}
-	}
-}
-
 func (l *Logger) pathFor(day string) string {
 	return filepath.Join(l.opts.Dir, filePrefix+day+fileSuffix)
 }
 
 func (l *Logger) now() time.Time { return l.opts.Clock() }
-
-// compress gzips src (BestSpeed: files can be large and this runs off the
-// hot path) and removes the plain file only on success. Every path closes
-// both handles explicitly, and the plain file's handle is closed BEFORE
-// the removal: on Windows a delete fails while any handle is open
-// (os.Open does not request FILE_SHARE_DELETE).
-func compress(src string, logger *slog.Logger) {
-	in, err := os.Open(src)
-	if err != nil {
-		return
-	}
-	ok := false
-	defer func() {
-		_ = in.Close()
-		if ok {
-			if err := os.Remove(src); err != nil && logger != nil {
-				logger.Warn("request log cleanup failed", "file", src, "err", err)
-			}
-		}
-	}()
-	out, err := os.Create(src + gzipSuffix)
-	if err != nil {
-		if logger != nil {
-			logger.Warn("request log compression failed", "file", src, "err", err)
-		}
-		return
-	}
-	gz, err := gzip.NewWriterLevel(out, gzip.BestSpeed)
-	if err != nil { // unreachable with a valid level
-		_ = out.Close()
-		return
-	}
-	if _, err := io.Copy(gz, in); err != nil {
-		if logger != nil {
-			logger.Warn("request log compression failed", "file", src, "err", err)
-		}
-		_ = gz.Close()
-		_ = out.Close()
-		return
-	}
-	if err := gz.Close(); err != nil {
-		if logger != nil {
-			logger.Warn("request log compression failed", "file", src, "err", err)
-		}
-		_ = out.Close()
-		return
-	}
-	if err := out.Close(); err != nil {
-		if logger != nil {
-			logger.Warn("request log compression failed", "file", src, "err", err)
-		}
-		return
-	}
-	ok = true
-}

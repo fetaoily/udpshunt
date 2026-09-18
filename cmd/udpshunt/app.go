@@ -9,6 +9,7 @@ import (
 
 	"github.com/fetaoily/udpshunt/internal/admin"
 	"github.com/fetaoily/udpshunt/internal/balancer"
+	"github.com/fetaoily/udpshunt/internal/clientstats"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/health"
 	"github.com/fetaoily/udpshunt/internal/listener"
@@ -21,13 +22,14 @@ import (
 // App supervises listeners, balancers and health probes across config
 // reloads (spec §6).
 type App struct {
-	cfgPath string
-	logger  *slog.Logger
-	met     *metrics.Metrics
-	mgr     *session.Manager
-	events  *admin.Recorder
-	rates   *rates.Collector
-	reqLog  *requestlog.Logger
+	cfgPath     string
+	logger      *slog.Logger
+	met         *metrics.Metrics
+	mgr         *session.Manager
+	events      *admin.Recorder
+	rates       *rates.Collector
+	reqLog      *requestlog.Logger
+	clientStats *clientstats.Table
 
 	mu        sync.Mutex
 	cfg       config.Config
@@ -135,7 +137,7 @@ func (a *App) startListenerLocked(ctx context.Context, lc config.Listener) error
 		a.events.Add("backend_down", fmt.Sprintf("%s %s closed=%d", lc.Name, addr, n))
 		a.logger.Info("backend marked down, sessions closed", "listener", lc.Name, "backend", addr, "sessions", n)
 	})
-	l, err := listener.New(lc.Name, lc, bal, a.mgr, a.logger, a.met.ForListener(lc.Name), a.reqLog)
+	l, err := listener.New(lc.Name, lc, bal, a.mgr, a.logger, a.met.ForListener(lc.Name), a.reqLog, a.clientStats)
 	if err != nil {
 		return err
 	}
@@ -315,6 +317,21 @@ func (a *App) Status() admin.Status {
 		})
 	}
 	return st
+}
+
+// Clients serves the /clients endpoint: today's per-client-IP rows sorted
+// by the requested column.
+func (a *App) Clients(sortCol, order string, limit int) admin.ClientsStatus {
+	if a.clientStats == nil {
+		return admin.ClientsStatus{}
+	}
+	rows, tracked, evicted := a.clientStats.Top(sortCol, order == "asc", limit)
+	return admin.ClientsStatus{
+		Enabled: a.clientStats.Enabled(),
+		Tracked: tracked,
+		Evicted: evicted,
+		Rows:    rows,
+	}
 }
 
 // runSampler feeds the rate rings once per second until ctx is cancelled.

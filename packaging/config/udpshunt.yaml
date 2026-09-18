@@ -29,6 +29,17 @@ request_log:
   dir: /var/log/udpshunt
   retention_days: 30
 
+# Per-client-IP statistics: live counts/rates in the TUI and web UI,
+# snapshot file per day in dir (same rotation/retention as request_log).
+# Defaults when the section is absent: enabled, /var/log/udpshunt,
+# 30 days, 65536 IPs, 60s snapshots.
+client_stats:
+  enabled: true
+  dir: /var/log/udpshunt
+  retention_days: 30
+  max_ips: 65536
+  snapshot_interval: 60s
+
 logging:
   level: info
   format: text

@@ -7,7 +7,10 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/fetaoily/udpshunt/internal/admin"
+	"github.com/fetaoily/udpshunt/internal/clientstats"
 )
 
 func TestSparklineShapes(t *testing.T) {
@@ -95,5 +98,119 @@ func TestFetchStatusError(t *testing.T) {
 	defer ts.Close()
 	if _, err := fetchStatus(ts.URL); err == nil {
 		t.Fatal("expected error on 500")
+	}
+}
+
+func TestFetchClients(t *testing.T) {
+	var gotSort, gotOrder, gotLimit string
+	want := admin.ClientsStatus{
+		Enabled: true,
+		Tracked: 1,
+		Rows: []clientstats.Row{
+			{IP: "203.0.113.7", Requests: 3},
+		},
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		gotSort, gotOrder, gotLimit = q.Get("sort"), q.Get("order"), q.Get("limit")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(want)
+	}))
+	defer ts.Close()
+
+	got, err := fetchClients(ts.URL, "requests", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotSort != "requests" || gotOrder != "" || gotLimit != "100" {
+		t.Fatalf("query = sort=%q order=%q limit=%q", gotSort, gotOrder, gotLimit)
+	}
+	if len(got.Rows) != 1 || got.Rows[0].IP != "203.0.113.7" {
+		t.Fatalf("decoded = %+v", got)
+	}
+
+	if _, err := fetchClients(ts.URL, "bytes_in", true); err != nil {
+		t.Fatal(err)
+	}
+	if gotSort != "bytes_in" || gotOrder != "asc" {
+		t.Fatalf("asc query = sort=%q order=%q", gotSort, gotOrder)
+	}
+}
+
+func TestClientsViewRendersTable(t *testing.T) {
+	m := model{
+		view: "clients",
+		clients: &admin.ClientsStatus{
+			Enabled: true,
+			Tracked: 2,
+			Evicted: 1,
+			Rows: []clientstats.Row{
+				{IP: "203.0.113.7", Requests: 12, Responses: 10, BytesIn: 1200, BytesOut: 9800, PPSIn: 3, LastSeen: time.Now().Add(-2 * time.Second).UnixNano()},
+			},
+		},
+	}
+	v := m.View()
+	for _, want := range []string{"203.0.113.7", "tracked 2", "evicted 1", "s: sort column", "r: reverse"} {
+		if !contains(v, want) {
+			t.Fatalf("clients view missing %q:\n%s", want, v)
+		}
+	}
+}
+
+func TestClientsViewDisabled(t *testing.T) {
+	m := model{view: "clients", clients: &admin.ClientsStatus{Enabled: false}}
+	v := m.View()
+	if !contains(v, "disabled") {
+		t.Fatalf("disabled view must say so:\n%s", v)
+	}
+}
+
+func TestClientsKeyHandling(t *testing.T) {
+	m := model{addr: "http://x", interval: time.Second}
+	key := func(s string) tea.KeyMsg {
+		if s == "ctrl+c" {
+			return tea.KeyMsg{Type: tea.KeyCtrlC}
+		}
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+	step := func(cur model, k string) model {
+		next, _ := cur.Update(key(k))
+		return next.(model)
+	}
+
+	// c enters the clients view and issues a clients fetch.
+	m2, cmd := m.Update(key("c"))
+	if m2.(model).view != "clients" || cmd == nil {
+		t.Fatalf("c from dash: view=%q cmd=%v", m2.(model).view, cmd)
+	}
+	if _, ok := cmd().(clientsMsg); !ok {
+		t.Fatal("c must fetch clients immediately")
+	}
+
+	// s cycles the sort column and wraps after a full cycle.
+	m3 := m2.(model)
+	for i := 0; i < len(clientCols); i++ {
+		m3 = step(m3, "s")
+	}
+	if m3.sortIdx != m2.(model).sortIdx {
+		t.Fatalf("sortIdx=%d after full cycle, want wrap to %d", m3.sortIdx, m2.(model).sortIdx)
+	}
+
+	// r flips the direction.
+	asc := m3.sortAsc
+	m4 := step(m3, "r")
+	if m4.sortAsc == asc {
+		t.Fatal("r must flip sortAsc")
+	}
+
+	// c returns to the dashboard.
+	m5 := step(m4, "c")
+	if m5.view != "dash" {
+		t.Fatalf("c from clients: view=%q", m5.view)
+	}
+
+	// q quits.
+	if _, cmd := m5.Update(key("q")); cmd == nil {
+		t.Fatal("q must quit")
 	}
 }

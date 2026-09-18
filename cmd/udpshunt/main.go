@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/fetaoily/udpshunt/internal/admin"
+	"github.com/fetaoily/udpshunt/internal/clientstats"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/requestlog"
 	"github.com/fetaoily/udpshunt/internal/tui"
@@ -88,6 +89,18 @@ func run() error {
 		})
 		defer app.reqLog.Stop()
 	}
+	// Client stats follow the same lifecycle as the request log: created
+	// once, surviving reloads, nil (and free) when disabled.
+	if cfg.ClientStats.IsEnabled() {
+		app.clientStats = clientstats.New(clientstats.Options{
+			Dir:              cfg.ClientStats.Dir,
+			RetentionDays:    cfg.ClientStats.RetentionDays,
+			MaxIPs:           cfg.ClientStats.MaxIPs,
+			SnapshotInterval: time.Duration(cfg.ClientStats.SnapshotInterval),
+			Logger:           logger,
+		})
+		defer app.clientStats.Stop()
+	}
 	app.met.SetStartedAt(time.Now())
 	app.met.SetSessionStats(app.mgr.Created, app.mgr.Expired, app.mgr.Rejected,
 		func() int64 { return int64(app.mgr.Count()) })
@@ -99,6 +112,7 @@ func run() error {
 		Registry: app.met.Registry(),
 		Status:   app.Status,
 		Reload:   app.Reload,
+		Clients:  app.Clients,
 		Logger:   logger,
 		UI:       webui.Handler(),
 	})

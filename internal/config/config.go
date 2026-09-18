@@ -32,11 +32,12 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type Config struct {
-	Listeners  []Listener `yaml:"listeners"`
-	Sessions   Sessions   `yaml:"sessions"`
-	Logging    Logging    `yaml:"logging"`
-	Admin      Admin      `yaml:"admin"`
-	RequestLog RequestLog `yaml:"request_log"`
+	Listeners   []Listener  `yaml:"listeners"`
+	Sessions    Sessions    `yaml:"sessions"`
+	Logging     Logging     `yaml:"logging"`
+	Admin       Admin       `yaml:"admin"`
+	RequestLog  RequestLog  `yaml:"request_log"`
+	ClientStats ClientStats `yaml:"client_stats"`
 }
 
 type Listener struct {
@@ -84,6 +85,22 @@ type RequestLog struct {
 
 // IsEnabled reports whether request logging is on.
 func (r RequestLog) IsEnabled() bool { return r.Enabled != nil && *r.Enabled }
+
+// ClientStats configures the per-client-IP live statistics table: request
+// and response counts, upstream/downstream bytes and rates, aggregated per
+// IP across listeners, with a daily snapshot file for persistence. Enabled
+// by default; set enabled: false to turn it off.
+type ClientStats struct {
+	// Enabled is a pointer so an absent key means the default (true).
+	Enabled          *bool    `yaml:"enabled"`
+	Dir              string   `yaml:"dir"`
+	RetentionDays    int      `yaml:"retention_days"`
+	MaxIPs           int      `yaml:"max_ips"`
+	SnapshotInterval Duration `yaml:"snapshot_interval"`
+}
+
+// IsEnabled reports whether client stats are on.
+func (c ClientStats) IsEnabled() bool { return c.Enabled != nil && *c.Enabled }
 
 // Load reads the YAML file at path, applies defaults, and validates the result.
 func Load(path string) (Config, error) {
@@ -147,6 +164,22 @@ func applyDefaults(c *Config) {
 	}
 	if c.RequestLog.RetentionDays == 0 {
 		c.RequestLog.RetentionDays = 30
+	}
+	if c.ClientStats.Enabled == nil {
+		enabled := true
+		c.ClientStats.Enabled = &enabled
+	}
+	if c.ClientStats.Dir == "" {
+		c.ClientStats.Dir = defaultRequestLogDir()
+	}
+	if c.ClientStats.RetentionDays == 0 {
+		c.ClientStats.RetentionDays = 30
+	}
+	if c.ClientStats.MaxIPs == 0 {
+		c.ClientStats.MaxIPs = 65536
+	}
+	if c.ClientStats.SnapshotInterval == 0 {
+		c.ClientStats.SnapshotInterval = Duration(60 * time.Second)
 	}
 }
 
@@ -245,6 +278,17 @@ func (c Config) Validate() error {
 	}
 	if c.RequestLog.IsEnabled() && c.RequestLog.RetentionDays < 1 {
 		return fmt.Errorf("request_log.retention_days must be >= 1 when request logging is enabled")
+	}
+	if c.ClientStats.IsEnabled() {
+		if c.ClientStats.RetentionDays < 1 {
+			return fmt.Errorf("client_stats.retention_days must be >= 1 when client stats are enabled")
+		}
+		if c.ClientStats.MaxIPs < 1 {
+			return fmt.Errorf("client_stats.max_ips must be >= 1 when client stats are enabled")
+		}
+		if c.ClientStats.SnapshotInterval < 0 {
+			return fmt.Errorf("client_stats.snapshot_interval must be >= 0")
+		}
 	}
 	switch c.Logging.Level {
 	case "debug", "info", "warn", "error":

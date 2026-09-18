@@ -138,7 +138,7 @@ inherited from `sessions.timeout`); the live-session count is capped by
 triggers a graceful drain. Top-level keys: `listeners`, `sessions` (`timeout`,
 `max`), `logging` (`level`: debug|info|warn|error, default info; `format`:
 json|text, default json), `admin` (`bind`, default `127.0.0.1:9155`),
-`request_log` (below).
+`request_log` and `client_stats` (below).
 
 ### Request log
 
@@ -175,6 +175,41 @@ service start (needs systemd ≥ 240; older systemd silently skips it and
 udpshunt falls back to disabled-with-warning). In Docker, mount a volume and
 point `request_log.dir` at it — the default path is not writable by the
 non-root image user.
+
+### Client stats
+
+`client_stats` tracks per-client-IP statistics for the TUI and web UI:
+requests, responses, upstream/downstream bytes and their rates, aggregated
+per IP across listeners. It is **enabled by default**; set `enabled: false`
+to turn it off:
+
+```yaml
+client_stats:
+  enabled: true
+  dir: /var/log/udpshunt   # default: same default dir as request_log
+  retention_days: 30       # snapshot files older than this are deleted
+  max_ips: 65536           # in-memory cap; least-recently-active IPs are
+                           # evicted beyond it (counted as evicted)
+  snapshot_interval: 60s   # how often today's totals are written to disk
+```
+
+Counters are per-day. A snapshot of today's table is rewritten atomically
+every `snapshot_interval` (and once more on graceful shutdown), so a restart
+continues the current day's totals instead of starting from zero. At
+midnight the day's file is finalized, gzip-compressed
+(`udpshunt-clients-YYYY-MM-DD.jsonl.gz`) and the in-memory table resets —
+one JSON line per IP:
+
+```json
+{"ip":"203.0.113.7","requests":412,"responses":398,"bytes_in":30114,"bytes_out":128960,"last_seen":1789712345123456789}
+```
+
+The hot path pays one sharded-map lookup per packet (the same structure as
+the session table); rates are computed by a 1s background tick, never on
+the data path. If the directory cannot be created, udpshunt logs one
+warning and keeps running with client stats disabled. The table is served
+by `GET /clients` (below) and rendered in the TUI (`c` key) and in the web
+UI's clients panel.
 
 ### Balancing modes
 
@@ -233,10 +268,11 @@ serving.
 
 ## Admin API
 
-`admin.bind` serves four routes:
+`admin.bind` serves five routes:
 
 - `GET /metrics` — Prometheus text format (private registry, `udpshunt_` prefix).
 - `GET /status` — JSON snapshot: uptime, per-listener backends (health, session counts), session totals, request-log state (`dropped` counter), recent events, and per-listener rate history (last 5 min at 1s samples).
+- `GET /clients` — per-client-IP table (`?sort=<column>&order=asc|desc&limit=<n>`, default `requests`/`desc`/200; columns: `ip`, `requests`, `responses`, `bytes_in`, `bytes_out`, `pps_in`, `bps_in`, `bps_out`, `last_seen`). Returns `{enabled, tracked, evicted, rows}`.
 - `POST /reload` — reload the config file and apply it.
 - `GET /ui` — the embedded web dashboard (below).
 
@@ -276,13 +312,17 @@ API — the daemon itself must already be running:
 - `--addr` — admin API base URL (default `http://127.0.0.1:9155`).
 - `--interval` — poll interval (default `1s`).
 
-Press `q` or Ctrl-C to quit.
+Press `c` to open the per-client-IP table (top clients by today's traffic,
+htop-style): `s` cycles the sort column, `r` reverses the direction, `c`
+returns to the dashboard. Press `q` or Ctrl-C to quit.
 
 ### Web UI
 
 The admin API also serves a single-page dashboard at `/ui` on the same port
 (uptime and totals, per-listener rate charts, backend health, recent events;
-polls `/status` every 2s). The built asset is committed in
+polls `/status` every 2s). It also shows a clients panel — the per-client-IP
+table with click-to-sort column headers, polled from `/clients` every 2s.
+The built asset is committed in
 `internal/webui/dist` and embedded into the binary via `go:embed` — no extra
 files are needed at runtime.
 

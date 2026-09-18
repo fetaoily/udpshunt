@@ -5,6 +5,14 @@ export async function fetchStatus() {
   return res.json()
 }
 
+// clients fetch: top rows of the per-client-IP table, server-side sorted.
+export async function fetchClients(sort, order, limit) {
+  const q = new URLSearchParams({ sort, order, limit: String(limit) })
+  const res = await fetch('/clients?' + q)
+  if (!res.ok) throw new Error(`clients ${res.status}`)
+  return res.json()
+}
+
 // perSecond: rate between the last two cumulative samples.
 export function perSecond(history, key) {
   if (!history || history.length < 2) return 0

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/fetaoily/udpshunt/internal/balancer"
+	"github.com/fetaoily/udpshunt/internal/clientstats"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/requestlog"
 	"github.com/fetaoily/udpshunt/internal/session"
@@ -76,7 +77,7 @@ func newStack(t *testing.T, lc config.Listener, maxSessions int64) (*Listener, *
 	t.Helper()
 	mgr := session.NewManager(maxSessions)
 	bal := balancer.New(lc.Backends, balancer.Options{})
-	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, nil)
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +240,7 @@ func newStackWithLog(t *testing.T, lc config.Listener, maxSessions int64, rl *re
 	t.Helper()
 	mgr := session.NewManager(maxSessions)
 	bal := balancer.New(lc.Backends, balancer.Options{})
-	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, rl)
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, rl, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,4 +250,45 @@ func newStackWithLog(t *testing.T, lc config.Listener, maxSessions int64, rl *re
 	t.Cleanup(cancel)
 	go func() { _ = l.Run(ctx) }()
 	return l, bal, mgr
+}
+
+func TestClientStatsCounting(t *testing.T) {
+	stats := clientstats.New(clientstats.Options{Dir: t.TempDir(), TickEvery: time.Hour, SnapshotInterval: time.Hour})
+	t.Cleanup(stats.Stop)
+
+	backend := startEcho(t)
+	lc := config.Listener{Name: "cs", Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
+	mgr := session.NewManager(0)
+	bal := balancer.New(lc.Backends, balancer.Options{})
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, nil, stats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { _ = l.Close() })
+	t.Cleanup(func() { mgr.CloseAll() })
+	t.Cleanup(cancel)
+	go func() { _ = l.Run(ctx) }()
+
+	client := testClient(t)
+	if got := roundTrip(t, client, l.Addr(), "hello"); got != "echo:hello" {
+		t.Fatalf("reply = %q", got)
+	}
+
+	// PacketOut is recorded by the downstream goroutine after the client
+	// already saw the reply, so poll briefly for the row to complete.
+	var row clientstats.Row
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		rows, tracked, _ := stats.Top("requests", false, 0)
+		if tracked == 1 && len(rows) == 1 && rows[0].Responses >= 1 {
+			row = rows[0]
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if row.IP != "127.0.0.1" || row.Requests != 1 || row.Responses != 1 ||
+		row.BytesIn != 5 || row.BytesOut != int64(len("echo:hello")) {
+		t.Fatalf("stats row wrong: %+v", row)
+	}
 }

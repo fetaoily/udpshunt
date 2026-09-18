@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -30,6 +31,11 @@ type statusMsg struct {
 	err error
 }
 
+type clientsMsg struct {
+	cs  admin.ClientsStatus
+	err error
+}
+
 type tickMsg struct{}
 
 type model struct {
@@ -37,7 +43,14 @@ type model struct {
 	interval time.Duration
 
 	status  *admin.Status
+	clients *admin.ClientsStatus
 	errText string
+
+	// Clients view state: view is "dash" or "clients"; sortIdx indexes
+	// clientCols; sortAsc flips the /clients order parameter.
+	view    string
+	sortIdx int
+	sortAsc bool
 }
 
 func (m model) Init() tea.Cmd {
@@ -71,11 +84,56 @@ func fetchStatus(addr string) (admin.Status, error) {
 	return st, err
 }
 
+// fetchClients reads the top-100 client rows for the current sort column.
+func fetchClients(addr, sortCol string, asc bool) (admin.ClientsStatus, error) {
+	var cs admin.ClientsStatus
+	u := strings.TrimRight(addr, "/") + "/clients?sort=" + url.QueryEscape(sortCol) + "&limit=100"
+	if asc {
+		u += "&order=asc"
+	}
+	resp, err := httpClient.Get(u)
+	if err != nil {
+		return cs, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return cs, fmt.Errorf("clients endpoint returned %d", resp.StatusCode)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&cs)
+	return cs, err
+}
+
+func fetchClientsCmd(m model) tea.Cmd {
+	sortCol := clientCols[m.sortIdx].sort
+	return func() tea.Msg {
+		cs, err := fetchClients(m.addr, sortCol, m.sortAsc)
+		return clientsMsg{cs: cs, err: err}
+	}
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if s := msg.String(); s == "q" || s == "ctrl+c" {
+		switch msg.String() {
+		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "c":
+			if m.view == "clients" {
+				m.view = "dash"
+				return m, fetchCmd(m) // the dash view needs a fresh status now
+			}
+			m.view = "clients"
+			return m, fetchClientsCmd(m)
+		case "s":
+			if m.view == "clients" {
+				m.sortIdx = (m.sortIdx + 1) % len(clientCols)
+				return m, fetchClientsCmd(m)
+			}
+		case "r":
+			if m.view == "clients" {
+				m.sortAsc = !m.sortAsc
+				return m, fetchClientsCmd(m)
+			}
 		}
 	case tea.WindowSizeMsg:
 		return m, nil
@@ -87,13 +145,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errText = ""
 		}
 		return m, tickCmd(m.interval)
+	case clientsMsg:
+		if msg.err != nil {
+			m.errText = msg.err.Error()
+		} else {
+			m.clients = &msg.cs
+			m.errText = ""
+		}
+		return m, tickCmd(m.interval)
 	case tickMsg:
+		// The chain follows the active view; a stale message from the other
+		// view just updates its snapshot harmlessly.
+		if m.view == "clients" {
+			return m, fetchClientsCmd(m)
+		}
 		return m, fetchCmd(m)
 	}
 	return m, nil
 }
 
 func (m model) View() string {
+	if m.view == "clients" {
+		return m.viewClients()
+	}
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("udpshunt") + dimStyle.Render("  "+m.addr))
 	if m.errText != "" {
@@ -142,7 +216,49 @@ func (m model) View() string {
 	for _, e := range events {
 		fmt.Fprintf(&b, "  %s %s %s\n", e.Time.Format("15:04:05"), e.Kind, e.Detail)
 	}
-	b.WriteString(dimStyle.Render("\nq: quit"))
+	b.WriteString(dimStyle.Render("\nc: clients  q: quit"))
+	return b.String()
+}
+
+// viewClients renders the per-client-IP table (htop-style: click-free sort
+// via s / r keys).
+func (m model) viewClients() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("udpshunt clients") + dimStyle.Render("  "+m.addr))
+	if m.errText != "" {
+		b.WriteString("  " + downStyle.Render("ERR: "+m.errText))
+	}
+	b.WriteString("\n\n")
+	if m.clients == nil {
+		b.WriteString(dimStyle.Render("waiting for first sample...\n"))
+		return b.String()
+	}
+	cs := m.clients
+	if !cs.Enabled {
+		b.WriteString("client stats are disabled (client_stats.enabled: false in the config)\n")
+		b.WriteString(dimStyle.Render("\nc: dashboard  q: quit"))
+		return b.String()
+	}
+	col := clientCols[m.sortIdx]
+	dir := "desc"
+	if m.sortAsc {
+		dir = "asc"
+	}
+	fmt.Fprintf(&b, "tracked %d   evicted %d   sort %s %s\n\n", cs.Tracked, cs.Evicted, col.sort, dir)
+	b.WriteString(clientHeader(m.sortIdx, m.sortAsc) + "\n")
+	const maxRows = 20
+	rows := cs.Rows
+	if len(rows) > maxRows {
+		rows = rows[:maxRows]
+	}
+	now := time.Now()
+	for _, r := range rows {
+		b.WriteString(clientRow(r, now) + "\n")
+	}
+	if len(cs.Rows) > maxRows {
+		fmt.Fprintf(&b, dimStyle.Render("  ... %d more rows below\n"), len(cs.Rows)-maxRows)
+	}
+	b.WriteString(dimStyle.Render("\nc: dashboard  s: sort column  r: reverse  q: quit"))
 	return b.String()
 }
 

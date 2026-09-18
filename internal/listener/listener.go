@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/fetaoily/udpshunt/internal/balancer"
+	"github.com/fetaoily/udpshunt/internal/clientstats"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/metrics"
 	"github.com/fetaoily/udpshunt/internal/pktio"
@@ -31,6 +32,7 @@ type Listener struct {
 	mgr      *session.Manager
 	met      *metrics.ListenerMetrics
 	reqLog   *requestlog.Logger
+	stats    *clientstats.Table
 	timeout  time.Duration
 	logger   *slog.Logger
 	resolved map[string]*net.UDPAddr // backend address -> pre-resolved address
@@ -46,8 +48,8 @@ type Listener struct {
 // New binds the frontend UDP socket described by cfg.Bind and resolves every
 // backend address once so the receive loop never pays for DNS on new sessions.
 // met may be nil to run without metrics; reqLog may be nil to run without
-// the per-request file log.
-func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.Manager, logger *slog.Logger, met *metrics.ListenerMetrics, reqLog *requestlog.Logger) (*Listener, error) {
+// the per-request file log; stats may be nil to run without client stats.
+func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.Manager, logger *slog.Logger, met *metrics.ListenerMetrics, reqLog *requestlog.Logger, stats *clientstats.Table) (*Listener, error) {
 	addr, err := net.ResolveUDPAddr("udp", cfg.Bind)
 	if err != nil {
 		return nil, err
@@ -80,6 +82,7 @@ func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.
 		mgr:      mgr,
 		met:      met,
 		reqLog:   reqLog,
+		stats:    stats,
 		timeout:  time.Duration(cfg.SessionTimeout),
 		logger:   logger.With("listener", name),
 		resolved: resolved,
@@ -137,6 +140,7 @@ func (l *Listener) Run(ctx context.Context) error {
 		for i := 0; i < n; i++ {
 			l.met.PacketsIn(1)
 			l.met.BytesIn(sizes[i])
+			l.stats.PacketIn(addrs[i].IP, sizes[i])
 			l.handle(addrs[i], bufs[i][:sizes[i]])
 		}
 		if err != nil {
@@ -289,6 +293,7 @@ func (l *Listener) downstream(s *session.Session) {
 		}
 		l.met.PacketsOut(1)
 		l.met.BytesOut(n)
+		l.stats.PacketOut(s.Client.IP, n)
 		l.met.BackendOut(s.Backend, 1)
 		l.bal.ReportSuccess(s.Backend)
 	}

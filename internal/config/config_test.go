@@ -330,3 +330,75 @@ func TestRequestLogValidationErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestClientStatsDefaultsEnabled(t *testing.T) {
+	c, err := Load(writeConfig(t, baseListener))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.ClientStats.IsEnabled() {
+		t.Fatal("client stats must default to enabled")
+	}
+	if c.ClientStats.RetentionDays != 30 {
+		t.Fatalf("default retention_days = %d, want 30", c.ClientStats.RetentionDays)
+	}
+	if c.ClientStats.MaxIPs != 65536 {
+		t.Fatalf("default max_ips = %d, want 65536", c.ClientStats.MaxIPs)
+	}
+	if c.ClientStats.SnapshotInterval != Duration(60*time.Second) {
+		t.Fatalf("default snapshot_interval = %v, want 60s", c.ClientStats.SnapshotInterval)
+	}
+	if c.ClientStats.Dir == "" {
+		t.Fatal("default dir must not be empty")
+	}
+}
+
+func TestClientStatsExplicitDisable(t *testing.T) {
+	c, err := Load(writeConfig(t, baseListener+"client_stats:\n  enabled: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ClientStats.IsEnabled() {
+		t.Fatal("enabled: false must disable client stats")
+	}
+}
+
+func TestClientStatsExplicitSettings(t *testing.T) {
+	c, err := Load(writeConfig(t, baseListener+`
+client_stats:
+  enabled: true
+  dir: /tmp/cs
+  retention_days: 7
+  max_ips: 1024
+  snapshot_interval: 15s
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.ClientStats.IsEnabled() || c.ClientStats.Dir != "/tmp/cs" ||
+		c.ClientStats.RetentionDays != 7 || c.ClientStats.MaxIPs != 1024 ||
+		c.ClientStats.SnapshotInterval != Duration(15*time.Second) {
+		t.Fatalf("bad client_stats: %+v", c.ClientStats)
+	}
+}
+
+func TestClientStatsValidationErrors(t *testing.T) {
+	cases := map[string]string{
+		// retention_days: 0 / max_ips: 0 normalize to defaults (plain ints
+		// cannot distinguish unset from zero); only negatives are rejected.
+		"negative retention": baseListener + "client_stats:\n  retention_days: -3\n",
+		"negative max_ips":   baseListener + "client_stats:\n  max_ips: -1\n",
+		"negative interval":  baseListener + "client_stats:\n  snapshot_interval: -5s\n",
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, yaml))
+			if err == nil {
+				t.Fatalf("expected error for %s", name)
+			}
+			if !strings.HasPrefix(err.Error(), "invalid config: ") {
+				t.Fatalf("error for %s did not come from Validate: %v", name, err)
+			}
+		})
+	}
+}

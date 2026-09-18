@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/fetaoily/udpshunt/internal/admin"
+	"github.com/fetaoily/udpshunt/internal/clientstats"
 )
 
 var blocks = []rune{'▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
@@ -177,4 +178,81 @@ func rateSeries(samples []admin.Sample, in bool) []float64 {
 		}
 	}
 	return vals
+}
+
+// clientCols are the client-table columns in display order; sort is the
+// /clients query parameter each column maps to.
+var clientCols = []struct {
+	label string
+	sort  string
+}{
+	{"ip", "ip"},
+	{"req", "requests"},
+	{"req/s", "pps_in"},
+	{"resp", "responses"},
+	{"up/s", "bps_in"},
+	{"down/s", "bps_out"},
+	{"up", "bytes_in"},
+	{"down", "bytes_out"},
+	{"last", "last_seen"},
+}
+
+// clientColWidths are the fixed cell widths matching clientCols. Column
+// cells are padded with lipgloss styles (ANSI-aware), never Sprintf.
+var clientColWidths = []int{15, 7, 9, 7, 9, 9, 9, 9, 7}
+
+// clientHeader renders the header row, highlighting the active sort column
+// with a direction arrow.
+func clientHeader(sortIdx int, asc bool) string {
+	var b strings.Builder
+	for i, c := range clientCols {
+		label := c.label
+		st := dimStyle
+		if i == sortIdx {
+			arrow := "▼"
+			if asc {
+				arrow = "▲"
+			}
+			label = arrow + label
+			st = titleStyle
+		}
+		b.WriteString(st.Width(clientColWidths[i]).Render(label))
+	}
+	return b.String()
+}
+
+// clientRow renders one data row: IP left-aligned, numbers right-aligned.
+func clientRow(r clientstats.Row, now time.Time) string {
+	cells := []string{
+		r.IP,
+		fmt.Sprintf("%d", r.Requests),
+		fmt.Sprintf("%.0f", r.PPSIn),
+		fmt.Sprintf("%d", r.Responses),
+		humanBytes(r.BPSIn) + "/s",
+		humanBytes(r.BPSOut) + "/s",
+		humanBytes(float64(r.BytesIn)),
+		humanBytes(float64(r.BytesOut)),
+		lastSeenAgo(r.LastSeen, now),
+	}
+	var b strings.Builder
+	for i, c := range cells {
+		st := lipgloss.NewStyle().Width(clientColWidths[i])
+		if i > 0 {
+			st = st.Align(lipgloss.Right)
+		}
+		b.WriteString(st.Render(c))
+	}
+	return b.String()
+}
+
+// lastSeenAgo renders the time since lastSeen as a compact duration.
+func lastSeenAgo(lastSeen int64, now time.Time) string {
+	if lastSeen <= 0 {
+		return "-"
+	}
+	d := now.Sub(time.Unix(0, lastSeen))
+	if d < 0 {
+		d = 0
+	}
+	return d.Round(time.Second).String()
 }

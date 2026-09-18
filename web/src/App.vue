@@ -5,6 +5,7 @@
     <template v-if="status">
       <OverviewPanel :status="status" />
       <ListenerCard v-for="l in status.listeners ?? []" :key="l.name" :listener="l" />
+      <ClientsTable />
       <EventStream :events="status.events ?? []" />
     </template>
   </main>
@@ -15,6 +16,7 @@ import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { fetchStatus } from './lib/api.js'
 import OverviewPanel from './components/OverviewPanel.vue'
 import ListenerCard from './components/ListenerCard.vue'
+import ClientsTable from './components/ClientsTable.vue'
 import EventStream from './components/EventStream.vue'
 
 const status = ref(null)

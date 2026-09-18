@@ -28,3 +28,11 @@ request_log:
   enabled: true
   dir: /var/log/udpshunt
   retention_days: 30
+
+# Per-client-IP stats for the TUI/WebUI clients view (defaults shown).
+client_stats:
+  enabled: true
+  dir: /var/log/udpshunt
+  retention_days: 30
+  max_ips: 65536
+  snapshot_interval: 60s
