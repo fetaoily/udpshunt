@@ -1,7 +1,7 @@
 <template>
   <div class="card">
     <h3>{{ listener.name }} <span class="bind">{{ listener.bind }}</span> <span class="balance">{{ listener.balance }}</span></h3>
-    <div class="chart" :ref="chartRef"></div>
+    <div class="chart" ref="chartRef"></div>
     <table>
       <thead><tr><th>backend</th><th>health</th><th>sessions</th></tr></thead>
       <tbody>
