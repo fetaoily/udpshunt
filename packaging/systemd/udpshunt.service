@@ -9,6 +9,9 @@ Type=simple
 ExecStart=/usr/local/bin/udpshunt -c /etc/udpshunt/udpshunt.yaml
 Restart=always
 RestartSec=5
+# Every session holds a socket; systemd's default 1024/4096 ceiling makes
+# dials (and probe dials) fail under a few thousand concurrent sessions.
+LimitNOFILE=65536
 # No capabilities are requested here on purpose: kernels < 4.3 (e.g. CentOS 7
 # with systemd 219) cannot apply ambient capabilities, and systemd there fails
 # the whole spawn with status=218/CAPABILITIES if AmbientCapabilities is set.

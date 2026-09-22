@@ -76,7 +76,9 @@ The unit expects the binary at `/usr/local/bin/udpshunt` and the config at
 `/etc/udpshunt/udpshunt.yaml` (its `ExecStart` is
 `/usr/local/bin/udpshunt -c /etc/udpshunt/udpshunt.yaml`). It runs as `nobody` with
 `Restart=always` and no extra capabilities, so it starts on every systemd and
-kernel. Listeners must bind ports >= 1024; for low ports (e.g. `:53`) add the
+kernel, and sets `LimitNOFILE=65536` (every session holds a socket; the
+default 1024/4096 ceiling breaks dials at a few thousand concurrent
+sessions). Listeners must bind ports >= 1024; for low ports (e.g. `:53`) add the
 `AmbientCapabilities` drop-in documented in the unit file (needs kernel >= 4.3 —
 older kernels, such as CentOS 7's 3.10, cannot apply ambient capabilities and
 systemd would fail the service with status=218/CAPABILITIES).
@@ -272,11 +274,15 @@ about one extra `interval` (active) or `cooldown` (passive) compared to a
 naive error counter — in exchange, error bursts from busy-but-alive backends
 never evict sessions.
 
-Every error carries a source (`probe`, `upstream_write`, `dial`,
-`relay_read`); `backend_down` events and `/status` report who confirmed the
-down (`confirmed_by`) and the error sources behind it, so a panel is enough
-to answer "who killed this backend and why". Client-direction failures (a
-gone NAT mapping) never count against a backend.
+Every error carries a source (`probe`, `probe_dial`, `upstream_write`,
+`dial`, `relay_read`); `backend_down` events and `/status` report who
+confirmed the down (`confirmed_by`) and the error sources behind it, so a
+panel is enough to answer "who killed this backend and why".
+Client-direction failures (a gone NAT mapping) never count against a
+backend. `probe_dial` is a probe that failed before leaving the proxy
+(fd or ephemeral port exhaustion): it can raise a suspect
+(`last_error=probe_dial` on the panel means the PROXY is short on
+resources, not that the backend is sick) but never confirms a down.
 
 `on_down` (per listener, default `close`) decides what happens to a downed
 backend's live sessions: `close` terminates them immediately; `drain` lets
