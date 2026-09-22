@@ -17,9 +17,13 @@ const (
 
 // Error sources reported through ReportError/ReportSuccess. Only SrcProbe
 // (active checks) and SrcWindow (passive cooldown) may confirm a suspect
-// backend down; data-path sources alone never do.
+// backend down; data-path sources alone never do. SrcProbeDial is a probe
+// that failed before leaving this process (dial/write under fd or port
+// exhaustion): proxy-local evidence that counts toward the streak but never
+// confirms.
 const (
 	SrcProbe         = "probe"          // active health-check probe
+	SrcProbeDial     = "probe_dial"     // probe dial/write failed locally (proxy resource pressure, not backend)
 	SrcReply         = "reply"          // relayed backend reply (real traffic)
 	SrcUpstreamWrite = "upstream_write" // session-socket write to backend failed
 	SrcDial          = "dial"           // DialUDP for a new session failed

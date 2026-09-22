@@ -359,6 +359,30 @@ func TestProbeErrorConfirmsDown(t *testing.T) {
 	}
 }
 
+// A probe that failed before leaving this process (dial/write under fd or
+// port exhaustion) is evidence about the proxy, not the backend: it counts
+// toward the error streak and suspect entry — keeping local resource
+// pressure visible as backend_suspect last_error=probe_dial — but it must
+// never confirm a down.
+func TestProbeDialNeverConfirms(t *testing.T) {
+	b := New([]string{"a:1"}, Options{Fall: 1, Rise: 1, ActiveChecks: true, Cooldown: time.Hour})
+	for i := 0; i < 20; i++ {
+		b.ReportError("a:1", SrcProbeDial)
+	}
+	st := stateOf(b, "a:1")
+	if !st.Healthy || !st.Suspect {
+		t.Fatalf("probe_dial errors must suspect but never confirm, got %+v", st)
+	}
+	if st.LastErrorSource != SrcProbeDial {
+		t.Fatalf("LastErrorSource = %q, want %q", st.LastErrorSource, SrcProbeDial)
+	}
+	// A real probe failure (backend actually questioned and silent) confirms.
+	b.ReportError("a:1", SrcProbe)
+	if stateOf(b, "a:1").Healthy {
+		t.Fatal("probe error while suspect must still confirm down")
+	}
+}
+
 func TestSuspectBackendStillPicked(t *testing.T) {
 	b := New([]string{"a:1"}, Options{Fall: 1, Cooldown: time.Hour})
 	b.ReportError("a:1", SrcDial) // suspect; cooldown 1h: no window confirm
