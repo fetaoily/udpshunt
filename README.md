@@ -75,8 +75,11 @@ The admin port has no built-in authentication (see
 The unit expects the binary at `/usr/local/bin/udpshunt` and the config at
 `/etc/udpshunt/udpshunt.yaml` (its `ExecStart` is
 `/usr/local/bin/udpshunt -c /etc/udpshunt/udpshunt.yaml`). It runs as `nobody` with
-`Restart=always` and `CAP_NET_BIND_SERVICE`, so listeners on low ports (e.g.
-`:53`) work without root.
+`Restart=always` and no extra capabilities, so it starts on every systemd and
+kernel. Listeners must bind ports >= 1024; for low ports (e.g. `:53`) add the
+`AmbientCapabilities` drop-in documented in the unit file (needs kernel >= 4.3 —
+older kernels, such as CentOS 7's 3.10, cannot apply ambient capabilities and
+systemd would fail the service with status=218/CAPABILITIES).
 
 ## Quick start
 

@@ -9,9 +9,15 @@ Type=simple
 ExecStart=/usr/local/bin/udpshunt -c /etc/udpshunt/udpshunt.yaml
 Restart=always
 RestartSec=5
-# Binding low ports (e.g. :53) without running as root:
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=
+# No capabilities are requested here on purpose: kernels < 4.3 (e.g. CentOS 7
+# with systemd 219) cannot apply ambient capabilities, and systemd there fails
+# the whole spawn with status=218/CAPABILITIES if AmbientCapabilities is set.
+# As User=nobody the daemon can bind ports >= 1024. To bind low ports (e.g.
+# :53) on a kernel >= 4.3 system, add this drop-in:
+#   # /etc/systemd/system/udpshunt.service.d/lowport.conf
+#   [Service]
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
