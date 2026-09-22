@@ -80,9 +80,12 @@ func TestBackendFailover(t *testing.T) {
 	// client port would pin to the first healthy backend and stop feeding
 	// errors to the dead one; each retransmit therefore comes from a fresh
 	// client port (a new client flow), keeping round-robin offering the
-	// dead backend until it is evicted (3 consecutive errors). Keep going
-	// until BOTH the client is served AND the dead backend is unhealthy.
-	deadline := time.Now().Add(8 * time.Second)
+	// dead backend until it is evicted (3 consecutive errors). Since the
+	// two-phase down, those errors only make the backend suspect; passive
+	// down additionally needs the default 10s cooldown window (no prober
+	// here) before a Pick/Snapshot view confirms it. Keep going until BOTH
+	// the client is served AND the dead backend is unhealthy.
+	deadline := time.Now().Add(15 * time.Second)
 	ok := false
 	down := false
 	for time.Now().Before(deadline) && !(ok && down) {

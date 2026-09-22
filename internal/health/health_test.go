@@ -110,11 +110,13 @@ func TestRawProbeMarksSilentBackendDown(t *testing.T) {
 func TestDNSProbeRespondsToAnyReply(t *testing.T) {
 	addr := startResponder(t) // echoes the DNS query verbatim: still a reply
 	bal := balancer.New([]string{addr}, balancer.Options{Fall: 2, Rise: 1, ActiveChecks: true})
-	// push it down first, then prove the dns probe recovers it
-	bal.ReportError(addr)
-	bal.ReportError(addr)
+	// push it down first (fall=2: two errors suspect, a probe error
+	// confirms), then prove the dns probe recovers it
+	bal.ReportError(addr, balancer.SrcDial)
+	bal.ReportError(addr, balancer.SrcDial)
+	bal.ReportError(addr, balancer.SrcProbe)
 	if healthy(bal, addr) {
-		t.Fatal("should be down after 2 errors")
+		t.Fatal("should be down after suspect + probe confirm")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

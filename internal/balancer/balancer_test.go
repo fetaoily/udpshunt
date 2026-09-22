@@ -8,6 +8,15 @@ import (
 	"time"
 )
 
+func stateOf(b *Balancer, addr string) BackendState {
+	for _, st := range b.Snapshot() {
+		if st.Addr == addr {
+			return st
+		}
+	}
+	return BackendState{}
+}
+
 func TestRoundRobinSequence(t *testing.T) {
 	b := New([]string{"a:1", "b:1", "c:1"}, Options{})
 	want := []string{"a:1", "b:1", "c:1", "a:1", "b:1", "c:1"}
@@ -19,57 +28,65 @@ func TestRoundRobinSequence(t *testing.T) {
 }
 
 func TestPassiveDownAndCooldown(t *testing.T) {
-	b := New([]string{"a:1", "b:1"}, Options{Cooldown: 20 * time.Millisecond})
+	b := New([]string{"a:1", "b:1"}, Options{Cooldown: 25 * time.Millisecond})
 	for i := 0; i < 3; i++ { // fall default 3
-		b.ReportError("b:1")
+		b.ReportError("b:1", SrcRelayRead)
 	}
-	for _, st := range b.Snapshot() {
-		if st.Addr == "b:1" && st.Healthy {
-			t.Fatal("b:1 should be down after 3 errors")
-		}
+	if st := stateOf(b, "b:1"); !st.Healthy || !st.Suspect {
+		t.Fatalf("fall errors must suspect, not down: %+v", st)
 	}
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(60 * time.Millisecond) // > Cooldown: window confirm on next view
+	if st := stateOf(b, "b:1"); st.Healthy {
+		t.Fatal("window elapsed with no liveness: b:1 should be down")
+	}
+	time.Sleep(60 * time.Millisecond) // cooldown recovery
+	if st := stateOf(b, "b:1"); !st.Healthy {
+		t.Fatal("cooldown elapsed: b:1 should be healthy again")
+	}
 	if got := b.Pick(""); got == "" {
 		t.Fatal("pick must work after cooldown")
-	}
-	if !b.Snapshot()[1].Healthy {
-		t.Fatal("cooldown elapsed: b:1 should be healthy again")
 	}
 }
 
 func TestConfigurableFall(t *testing.T) {
-	b := New([]string{"a:1"}, Options{Fall: 1})
-	b.ReportError("a:1")
-	if b.Snapshot()[0].Healthy {
-		t.Fatal("fall=1 should mark down on first error")
+	b := New([]string{"a:1"}, Options{Fall: 1, Cooldown: 20 * time.Millisecond})
+	b.ReportError("a:1", SrcDial)
+	if st := stateOf(b, "a:1"); !st.Suspect {
+		t.Fatal("fall=1 must suspect on first error")
+	}
+	time.Sleep(40 * time.Millisecond)
+	if st := stateOf(b, "a:1"); st.Healthy {
+		t.Fatal("window confirm must down the backend after cooldown")
 	}
 }
 
 func TestActiveRiseRecovery(t *testing.T) {
 	b := New([]string{"a:1"}, Options{Fall: 1, Rise: 2, ActiveChecks: true, Cooldown: time.Hour})
-	b.ReportError("a:1")
-	if b.Snapshot()[0].Healthy {
+	b.ReportError("a:1", SrcDial)  // suspect
+	b.ReportError("a:1", SrcProbe) // confirmed down
+	if stateOf(b, "a:1").Healthy {
 		t.Fatal("should be down")
 	}
-	b.ReportSuccess("a:1") // rise 1/2
-	if b.Snapshot()[0].Healthy {
+	b.ReportSuccess("a:1", SrcProbe) // rise 1/2
+	if stateOf(b, "a:1").Healthy {
 		t.Fatal("must stay down until rise successes reached")
 	}
-	b.ReportSuccess("a:1") // rise 2/2
-	if !b.Snapshot()[0].Healthy {
+	b.ReportSuccess("a:1", SrcProbe) // rise 2/2
+	if !stateOf(b, "a:1").Healthy {
 		t.Fatal("rise reached: should be up")
 	}
 }
 
 func TestActiveModeIgnoresCooldown(t *testing.T) {
 	b := New([]string{"a:1"}, Options{Fall: 1, Rise: 5, ActiveChecks: true, Cooldown: time.Millisecond})
-	b.ReportError("a:1")
-	time.Sleep(10 * time.Millisecond)
+	b.ReportError("a:1", SrcDial)  // suspect
+	b.ReportError("a:1", SrcProbe) // down; window path must never run (active)
+	time.Sleep(20 * time.Millisecond)
 	for i := 0; i < 10; i++ {
 		b.Pick("") // would recover via cooldown in passive mode
 	}
-	if b.Snapshot()[0].Healthy {
-		t.Fatal("active mode: recovery only via rise, never cooldown")
+	if stateOf(b, "a:1").Healthy {
+		t.Fatal("active mode: recovery only via rise, never cooldown or window")
 	}
 }
 
@@ -122,12 +139,13 @@ func TestSourceHashDeterministicAndStable(t *testing.T) {
 }
 
 func TestSourceHashSkipsUnhealthy(t *testing.T) {
-	b := New([]string{"a:1", "b:1"}, Options{Balance: "source_hash", Fall: 1})
+	b := New([]string{"a:1", "b:1"}, Options{Balance: "source_hash", Fall: 1, Cooldown: 20 * time.Millisecond})
 	victim := b.Pick("10.0.0.7")
-	b.ReportError(victim)
+	b.ReportError(victim, SrcDial) // suspect; still pickable until window elapses
+	time.Sleep(40 * time.Millisecond)
 	for i := 0; i < 3; i++ {
 		if got := b.Pick("10.0.0.7"); got == victim {
-			t.Fatal("unhealthy backend must not be picked")
+			t.Fatal("down backend must not be picked")
 		}
 	}
 }
@@ -140,8 +158,9 @@ func TestEmptyPoolGuard(t *testing.T) {
 }
 
 func TestUpdateKeepsStateAndAddsHealthy(t *testing.T) {
-	b := New([]string{"a:1", "b:1"}, Options{Fall: 1})
-	b.ReportError("a:1")
+	b := New([]string{"a:1", "b:1"}, Options{Fall: 1, ActiveChecks: true, Cooldown: time.Hour})
+	b.ReportError("a:1", SrcDial)    // suspect
+	b.ReportError("a:1", SrcProbe)   // down (survives Update)
 	b.Update([]string{"a:1", "c:1"}) // drop b:1, add c:1
 	st := b.Snapshot()
 	if len(st) != 2 {
@@ -175,60 +194,43 @@ func TestSetBalanceLive(t *testing.T) {
 func TestSetHealthLive(t *testing.T) {
 	b := New([]string{"a:1"}, Options{Cooldown: time.Hour}) // passive defaults
 	b.SetHealth(true, 3, 1)                                 // active, fall 1
-	b.ReportError("a:1")
-	if b.Snapshot()[0].Healthy {
-		t.Fatal("live-updated fall=1 must mark down on first error")
+	b.ReportError("a:1", SrcDial)                           // suspect
+	b.ReportError("a:1", SrcProbe)                          // confirmed down
+	if stateOf(b, "a:1").Healthy {
+		t.Fatal("live-updated fall=1 must down on suspect+probe error")
 	}
 	for i := 0; i < 10; i++ {
 		b.Pick("") // active now: cooldown must not recover
 	}
-	if b.Snapshot()[0].Healthy {
+	if stateOf(b, "a:1").Healthy {
 		t.Fatal("live-updated active mode must ignore cooldown")
 	}
 }
 
 func TestPassiveCooldownRecoveryFiresOnState(t *testing.T) {
-	// Recovery observed through Pick.
-	b := New([]string{"b:1"}, Options{Fall: 1, Cooldown: 20 * time.Millisecond})
+	// Full passive cycle observed through Pick/Snapshot callbacks:
+	// H->S (error), S->D (window), D->H (cooldown recovery).
+	b := New([]string{"b:1"}, Options{Fall: 1, Cooldown: 25 * time.Millisecond})
 	var mu sync.Mutex
-	var ups []string
-	b.SetOnStateChange(func(addr string, healthy bool) {
+	var ts []Transition
+	b.SetOnStateChange(func(t Transition) {
 		mu.Lock()
-		if healthy {
-			ups = append(ups, addr)
-		}
+		ts = append(ts, t)
 		mu.Unlock()
 	})
-	b.ReportError("b:1") // fall=1: down (fires the down transition)
-	time.Sleep(30 * time.Millisecond)
+	b.ReportError("b:1", SrcDial) // H->S
+	time.Sleep(60 * time.Millisecond)
+	if b.Pick("") != "b:1" {
+		t.Fatal("pick must still serve the suspect backend")
+	}
+	time.Sleep(60 * time.Millisecond)
 	if b.Pick("") != "b:1" {
 		t.Fatal("pick must serve the backend again after cooldown")
 	}
 	mu.Lock()
-	if len(ups) != 1 || ups[0] != "b:1" {
-		mu.Unlock()
-		t.Fatalf("Pick must fire onState(b:1, true) on cooldown recovery, got %v", ups)
-	}
-	mu.Unlock()
-
-	// Recovery observed through Snapshot on a fresh balancer, still with no
-	// ReportSuccess anywhere: only the passive cooldown recovers.
-	b2 := New([]string{"a:1"}, Options{Fall: 1, Cooldown: 20 * time.Millisecond})
-	var ups2 []string
-	b2.SetOnStateChange(func(addr string, healthy bool) {
-		mu.Lock()
-		if healthy {
-			ups2 = append(ups2, addr)
-		}
-		mu.Unlock()
-	})
-	b2.ReportError("a:1")
-	time.Sleep(30 * time.Millisecond)
-	b2.Snapshot()
-	mu.Lock()
 	defer mu.Unlock()
-	if len(ups2) != 1 || ups2[0] != "a:1" {
-		t.Fatalf("Snapshot must fire onState(a:1, true) on cooldown recovery, got %v", ups2)
+	if len(ts) != 3 || ts[1].To != StateDown || ts[1].Source != SrcWindow || ts[2].To != StateHealthy {
+		t.Fatalf("want [H->S, S->D window, D->H], got %+v", ts)
 	}
 }
 
@@ -245,9 +247,9 @@ func TestConcurrentReportsKeepConsistentState(t *testing.T) {
 					addr = "b:1"
 				}
 				if i%3 == 0 {
-					b.ReportSuccess(addr)
+					b.ReportSuccess(addr, SrcReply)
 				} else {
-					b.ReportError(addr)
+					b.ReportError(addr, SrcRelayRead)
 				}
 				if i%50 == 0 {
 					_ = b.Pick("")
@@ -271,35 +273,42 @@ func TestConcurrentReportsKeepConsistentState(t *testing.T) {
 func TestOnStateChangeBothDirections(t *testing.T) {
 	b := New([]string{"a:1"}, Options{Fall: 1, Rise: 1, ActiveChecks: true})
 	var mu sync.Mutex
-	events := []bool{}
-	b.SetOnStateChange(func(addr string, healthy bool) {
+	var events []State
+	b.SetOnStateChange(func(t Transition) {
 		mu.Lock()
-		events = append(events, healthy)
+		events = append(events, t.To)
 		mu.Unlock()
 	})
-	b.ReportError("a:1")
-	b.ReportSuccess("a:1")
+	b.ReportError("a:1", SrcDial)    // -> suspect
+	b.ReportError("a:1", SrcProbe)   // -> down
+	b.ReportSuccess("a:1", SrcProbe) // rise=1 -> up
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
-		if len(events) == 2 {
-			mu.Unlock()
-			if events[0] || !events[1] {
-				t.Fatalf("want [down up], got %v", events)
+		done := len(events) == 3
+		mu.Unlock()
+		if done {
+			mu.Lock()
+			want := []State{StateSuspect, StateDown, StateHealthy}
+			for i := range want {
+				if events[i] != want[i] {
+					t.Fatalf("want %v, got %v", want, events)
+				}
 			}
+			mu.Unlock()
 			return
 		}
-		mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("expected 2 state-change events, got %v", events)
+	t.Fatalf("expected 3 state-change events, got %v", events)
 }
 
 func TestFailOpenAlternatesAcrossAllDownBackends(t *testing.T) {
-	b := New([]string{"a:1", "b:1"}, Options{ActiveChecks: true, Cooldown: time.Hour})
-	for i := 0; i < 3; i++ {
-		b.ReportError("a:1")
-		b.ReportError("b:1")
+	b := New([]string{"a:1", "b:1"}, Options{Fall: 2, ActiveChecks: true, Cooldown: time.Hour})
+	for _, addr := range []string{"a:1", "b:1"} {
+		b.ReportError(addr, SrcDial)  // errCount=1
+		b.ReportError(addr, SrcDial)  // =fall: suspect
+		b.ReportError(addr, SrcProbe) // confirm: down
 	}
 	got := map[string]int{}
 	for i := 0; i < 6; i++ {
@@ -307,5 +316,89 @@ func TestFailOpenAlternatesAcrossAllDownBackends(t *testing.T) {
 	}
 	if got["a:1"] == 0 || got["b:1"] == 0 {
 		t.Fatalf("fail-open pinned to one backend: %v", got)
+	}
+}
+
+func TestSuspectClearedByReply(t *testing.T) {
+	b := New([]string{"a:1"}, Options{Fall: 1})
+	b.ReportError("a:1", SrcRelayRead)
+	if st := stateOf(b, "a:1"); !st.Suspect || !st.Healthy {
+		t.Fatalf("want suspect+healthy after fall errors, got %+v", st)
+	}
+	b.ReportSuccess("a:1", SrcReply)
+	if st := stateOf(b, "a:1"); st.Suspect || st.ErrCount != 0 {
+		t.Fatalf("reply must clear suspect and errors, got %+v", st)
+	}
+}
+
+func TestDataErrorsDoNotConfirmDown(t *testing.T) {
+	b := New([]string{"a:1"}, Options{Fall: 1, ActiveChecks: true, Cooldown: time.Hour})
+	b.ReportError("a:1", SrcDial) // fall=1: suspect
+	for i := 0; i < 10; i++ {
+		b.ReportError("a:1", SrcRelayRead) // data-path errors never confirm
+	}
+	st := stateOf(b, "a:1")
+	if !st.Healthy || !st.Suspect {
+		t.Fatalf("data-path errors must not confirm down, got %+v", st)
+	}
+	if st.LastErrorSource != SrcRelayRead {
+		t.Fatalf("LastErrorSource = %q, want %q", st.LastErrorSource, SrcRelayRead)
+	}
+}
+
+func TestProbeErrorConfirmsDown(t *testing.T) {
+	b := New([]string{"a:1"}, Options{Fall: 1, Rise: 1, ActiveChecks: true, Cooldown: time.Hour})
+	b.ReportError("a:1", SrcDial)  // suspect
+	b.ReportError("a:1", SrcProbe) // confirm
+	st := stateOf(b, "a:1")
+	if st.Healthy {
+		t.Fatal("probe error while suspect must confirm down")
+	}
+	if st.DownConfirmBy != SrcProbe {
+		t.Fatalf("DownConfirmBy = %q, want %q", st.DownConfirmBy, SrcProbe)
+	}
+}
+
+func TestSuspectBackendStillPicked(t *testing.T) {
+	b := New([]string{"a:1"}, Options{Fall: 1, Cooldown: time.Hour})
+	b.ReportError("a:1", SrcDial) // suspect; cooldown 1h: no window confirm
+	for i := 0; i < 5; i++ {
+		if got := b.Pick(""); got != "a:1" {
+			t.Fatalf("suspect backend must stay pickable, got %q", got)
+		}
+	}
+}
+
+func TestSuspectWindowConfirmTransition(t *testing.T) {
+	b := New([]string{"a:1"}, Options{Fall: 1, Cooldown: 25 * time.Millisecond})
+	var mu sync.Mutex
+	var ts []Transition
+	b.SetOnStateChange(func(t Transition) {
+		mu.Lock()
+		ts = append(ts, t)
+		mu.Unlock()
+	})
+	b.ReportError("a:1", SrcDial) // H->S
+	time.Sleep(60 * time.Millisecond)
+	b.Snapshot() // window confirm S->D fires here
+	time.Sleep(60 * time.Millisecond)
+	b.Snapshot() // cooldown recovery D->H fires here
+	mu.Lock()
+	defer mu.Unlock()
+	want := []struct {
+		from, to State
+		source   string
+	}{
+		{StateHealthy, StateSuspect, SrcDial},
+		{StateSuspect, StateDown, SrcWindow},
+		{StateDown, StateHealthy, ""},
+	}
+	if len(ts) != len(want) {
+		t.Fatalf("transitions = %+v, want %d", ts, len(want))
+	}
+	for i, w := range want {
+		if ts[i].From != w.from || ts[i].To != w.to || ts[i].Source != w.source {
+			t.Fatalf("transition %d = %+v, want %+v", i, ts[i], w)
+		}
 	}
 }

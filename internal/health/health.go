@@ -70,9 +70,9 @@ func (p *Prober) probeLoop(ctx context.Context, bal *balancer.Balancer, addr str
 			return
 		}
 		if err := probeOnce(raddr, payload, timeout, buf); err != nil {
-			bal.ReportError(addr)
+			bal.ReportError(addr, balancer.SrcProbe)
 		} else {
-			bal.ReportSuccess(addr)
+			bal.ReportSuccess(addr, balancer.SrcProbe)
 		}
 		select {
 		case <-ctx.Done():

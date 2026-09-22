@@ -127,15 +127,16 @@ func (a *App) startListenerLocked(ctx context.Context, lc config.Listener) error
 		Fall:         lc.HealthCheck.Fall,
 		Counts:       func(addr string) int64 { return a.mgr.BackendCount(lc.Name, addr) },
 	})
-	bal.SetOnStateChange(func(addr string, healthy bool) {
-		a.met.SetBackendHealthy(lc.Name, addr, healthy)
+	bal.SetOnStateChange(func(t balancer.Transition) {
+		healthy := t.To != balancer.StateDown
+		a.met.SetBackendHealthy(lc.Name, t.Addr, healthy)
 		if healthy {
-			a.events.Add("backend_up", lc.Name+" "+addr)
+			a.events.Add("backend_up", lc.Name+" "+t.Addr)
 			return
 		}
-		n := a.mgr.CloseBackend(lc.Name, addr)
-		a.events.Add("backend_down", fmt.Sprintf("%s %s closed=%d", lc.Name, addr, n))
-		a.logger.Info("backend marked down, sessions closed", "listener", lc.Name, "backend", addr, "sessions", n)
+		n := a.mgr.CloseBackend(lc.Name, t.Addr)
+		a.events.Add("backend_down", fmt.Sprintf("%s %s closed=%d", lc.Name, t.Addr, n))
+		a.logger.Info("backend marked down, sessions closed", "listener", lc.Name, "backend", t.Addr, "sessions", n)
 	})
 	l, err := listener.New(lc.Name, lc, bal, a.mgr, a.logger, a.met.ForListener(lc.Name), a.reqLog, a.clientStats)
 	if err != nil {

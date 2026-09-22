@@ -187,7 +187,7 @@ func (l *Listener) forward(client *net.UDPAddr, pkt []byte) (backend, outcome st
 	s.Touch()
 	if _, err := s.Upstream().Write(pkt); err != nil {
 		l.met.BackendError(s.Backend)
-		l.bal.ReportError(s.Backend)
+		l.bal.ReportError(s.Backend, balancer.SrcUpstreamWrite)
 		l.mgr.Remove(l.name, client)
 		return s.Backend, requestlog.OutcomeUpstreamError
 	}
@@ -225,7 +225,7 @@ func (l *Listener) createSession(client *net.UDPAddr) (*session.Session, string)
 	}
 	up, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
-		l.bal.ReportError(backendAddr)
+		l.bal.ReportError(backendAddr, balancer.SrcDial)
 		l.logger.Warn("dial upstream failed", "backend", backendAddr, "err", err)
 		return nil, requestlog.OutcomeUpstreamError
 	}
@@ -274,7 +274,7 @@ func (l *Listener) downstream(s *session.Session) {
 			downstreamBufs.Put(buf)
 			if !errors.Is(err, net.ErrClosed) {
 				l.met.BackendError(s.Backend)
-				l.bal.ReportError(s.Backend)
+				l.bal.ReportError(s.Backend, balancer.SrcRelayRead)
 			}
 			l.mgr.Remove(l.name, s.Client)
 			return
@@ -287,7 +287,7 @@ func (l *Listener) downstream(s *session.Session) {
 				return
 			}
 			l.met.BackendError(s.Backend)
-			l.bal.ReportError(s.Backend)
+			l.bal.ReportError(s.Backend, balancer.SrcRelayRead)
 			l.mgr.Remove(l.name, s.Client)
 			return
 		}
@@ -295,7 +295,7 @@ func (l *Listener) downstream(s *session.Session) {
 		l.met.BytesOut(n)
 		l.stats.PacketOut(s.Client.IP, n)
 		l.met.BackendOut(s.Backend, 1)
-		l.bal.ReportSuccess(s.Backend)
+		l.bal.ReportSuccess(s.Backend, balancer.SrcReply)
 	}
 }
 
