@@ -69,8 +69,16 @@ func (p *Prober) probeLoop(ctx context.Context, bal *balancer.Balancer, addr str
 		if ctx.Err() != nil {
 			return
 		}
-		if err := probeOnce(raddr, payload, timeout, buf); err != nil {
-			bal.ReportError(addr, balancer.SrcProbe)
+		local, err := probeOnce(raddr, payload, timeout, buf)
+		if err != nil {
+			if local {
+				// The probe never left this process (dial/write failed under
+				// fd or port exhaustion): proxy-local evidence, never backend
+				// evidence, so it cannot confirm a down.
+				bal.ReportError(addr, balancer.SrcProbeDial)
+			} else {
+				bal.ReportError(addr, balancer.SrcProbe)
+			}
 		} else {
 			bal.ReportSuccess(addr, balancer.SrcProbe)
 		}
@@ -84,21 +92,25 @@ func (p *Prober) probeLoop(ctx context.Context, bal *balancer.Balancer, addr str
 
 // probeOnce sends the payload on a fresh connected socket and waits for any
 // response until the deadline. A fresh socket per probe keeps a stale ICMP
-// error from poisoning the next round.
-func probeOnce(raddr *net.UDPAddr, payload []byte, timeout time.Duration, buf []byte) error {
+// error from poisoning the next round. local reports whether a failure
+// happened before the question reached the backend (dial or write): such
+// errors say nothing about the backend. Read failures — deadline expiry
+// (backend silent) or ICMP-derived errors (backend refused) — are
+// backend-side evidence.
+func probeOnce(raddr *net.UDPAddr, payload []byte, timeout time.Duration, buf []byte) (local bool, err error) {
 	conn, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
-		return err
+		return true, err
 	}
 	defer conn.Close()
 	if _, err := conn.Write(payload); err != nil {
-		return err
+		return true, err
 	}
 	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return err
+		return true, err
 	}
 	if _, err := conn.Read(buf); err != nil {
-		return err // includes timeout (i/o timeout) and ICMP-derived errors
+		return false, err // includes timeout (i/o timeout) and ICMP-derived errors
 	}
-	return nil
+	return false, nil
 }
