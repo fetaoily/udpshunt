@@ -402,3 +402,33 @@ func TestClientStatsValidationErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestOnDownValidation(t *testing.T) {
+	cases := map[string]struct {
+		yaml    string
+		wantErr bool
+		wantPol string
+	}{
+		"absent defaults to close": {yaml: baseListener, wantErr: false, wantPol: ""},
+		"close accepted":           {yaml: baseListener + "    on_down: close\n", wantErr: false, wantPol: "close"},
+		"drain accepted":           {yaml: baseListener + "    on_down: drain\n", wantErr: false, wantPol: "drain"},
+		"invalid rejected":         {yaml: baseListener + "    on_down: nuke\n", wantErr: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c, err := Load(writeConfig(t, tc.yaml))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("invalid on_down must be rejected")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := c.Listeners[0].OnDown; got != tc.wantPol {
+				t.Fatalf("OnDown = %q, want %q", got, tc.wantPol)
+			}
+		})
+	}
+}

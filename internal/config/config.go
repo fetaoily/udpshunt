@@ -48,6 +48,7 @@ type Listener struct {
 	SessionTimeout Duration    `yaml:"session_timeout"`
 	HealthCheck    HealthCheck `yaml:"health_check"`
 	ReadBuffer     int         `yaml:"read_buffer"` // SO_RCVBUF bytes; 0 -> listener default
+	OnDown         string      `yaml:"on_down"`     // close (default) | drain: keep live sessions until timeout on down
 }
 
 type Sessions struct {
@@ -265,6 +266,11 @@ func (c Config) Validate() error {
 		}
 		if l.ReadBuffer < 0 {
 			return fmt.Errorf("listeners[%d] (%s): read_buffer must be >= 0", i, l.Name)
+		}
+		switch l.OnDown {
+		case "", "close", "drain":
+		default:
+			return fmt.Errorf("listeners[%d] (%s): on_down must be close or drain, got %q", i, l.Name, l.OnDown)
 		}
 	}
 	if c.Sessions.Max < 0 {
