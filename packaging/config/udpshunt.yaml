@@ -6,6 +6,10 @@ listeners:
     backends: [127.0.0.1:19001, 127.0.0.1:19002]
     balance: round_robin
     session_timeout: 60s
+    # What happens to a downed backend's live sessions:
+    # close (default): terminate them immediately; drain: let them
+    # expire via session_timeout.
+    on_down: close
     health_check:
       mode: raw
       payload: "70696e67" # "ping"

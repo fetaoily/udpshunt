@@ -239,6 +239,7 @@ listeners:
     bind: 0.0.0.0:53
     backends: [10.0.0.1:53]
     read_buffer: 8388608  # 8 MiB
+    on_down: close  # close (default) or drain: fate of a downed backend's live sessions
 ```
 
 The request is best-effort: if the kernel refuses (for example a low
@@ -260,10 +261,32 @@ health_check:
 
 `raw` sends the payload and counts any reply within `timeout` as success;
 `dns` sends a built-in DNS query and counts any response (even NXDOMAIN).
-A backend marked down stops receiving new sessions and its live sessions are
-closed; with active checks on, recovery requires `rise` consecutive successes,
-otherwise a passive cooldown applies. A failed config reload never changes
-what is running.
+A backend's health is judged by evidence, not by raw error counts. Errors
+(data-path failures or probe timeouts) reaching `fall` put the backend in a
+*suspect* state — it keeps serving traffic. Only an independent confirmation
+marks it down: the next failed health probe (active mode), or a cooldown
+window of silence with no probe reply and no relayed backend reply (passive
+mode, no `health_check`). Any real backend reply or successful probe clears
+the suspect immediately. Detection of a truly dead backend therefore takes
+about one extra `interval` (active) or `cooldown` (passive) compared to a
+naive error counter — in exchange, error bursts from busy-but-alive backends
+never evict sessions.
+
+Every error carries a source (`probe`, `upstream_write`, `dial`,
+`relay_read`); `backend_down` events and `/status` report who confirmed the
+down (`confirmed_by`) and the error sources behind it, so a panel is enough
+to answer "who killed this backend and why". Client-direction failures (a
+gone NAT mapping) never count against a backend.
+
+`on_down` (per listener, default `close`) decides what happens to a downed
+backend's live sessions: `close` terminates them immediately; `drain` lets
+them run until `session_timeout`, trading up to one timeout of extra
+black-hole time on true failures for zero eviction cost on false positives.
+Draining sessions still count against `sessions.max` until they expire.
+Removing a backend from the config always closes its sessions, regardless of
+`on_down`.
+
+A failed config reload never changes what is running.
 
 ### Hot reload
 
@@ -279,7 +302,7 @@ serving.
 `admin.bind` serves five routes:
 
 - `GET /metrics` — Prometheus text format (private registry, `udpshunt_` prefix).
-- `GET /status` — JSON snapshot: uptime, per-listener backends (health, session counts), session totals, request-log state (`dropped` counter), recent events, and per-listener rate history (last 5 min at 1s samples).
+- `GET /status` — JSON snapshot: uptime, per-listener backends (health, session counts, plus per-backend `suspect`, `err_count`, `last_error` and `confirmed_by`; `confirmed_by` reflects the most recent down and persists after recovery, so it is meaningful only while the backend is down), session totals, request-log state (`dropped` counter), recent events, and per-listener rate history (last 5 min at 1s samples).
 - `GET /clients` — per-client-IP table (`?sort=<column>&order=asc|desc&limit=<n>`, default `requests`/`desc`/200; columns: `ip`, `requests`, `responses`, `bytes_in`, `bytes_out`, `pps_in`, `bps_in`, `bps_out`, `last_seen`). Returns `{enabled, tracked, evicted, rows}`.
 - `POST /reload` — reload the config file and apply it.
 - `GET /ui` — the embedded web dashboard (below).
