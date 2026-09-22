@@ -214,3 +214,23 @@ func TestClientsKeyHandling(t *testing.T) {
 		t.Fatal("q must quit")
 	}
 }
+
+func TestUniqueBackendHealth(t *testing.T) {
+	st := admin.Status{Listeners: []admin.ListenerStatus{
+		{Name: "watchdog", Backends: []admin.BackendStatus{
+			{Addr: "10.0.0.1:1", Healthy: false},
+			{Addr: "10.0.0.2:1", Healthy: true},
+		}},
+		{Name: "prod", Backends: []admin.BackendStatus{
+			{Addr: "10.0.0.1:1", Healthy: true}, // same addr as above: one backend, any-healthy
+			{Addr: "10.0.0.3:1", Healthy: false},
+		}},
+	}}
+	healthy, total := uniqueBackendHealth(&st)
+	if total != 3 {
+		t.Fatalf("total = %d, want 3 (distinct addresses)", total)
+	}
+	if healthy != 2 {
+		t.Fatalf("healthy = %d, want 2 (10.0.0.1 up in prod, 10.0.0.2 up)", healthy)
+	}
+}

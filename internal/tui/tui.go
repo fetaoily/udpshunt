@@ -183,15 +183,7 @@ func (m model) View() string {
 
 	tv := totalsFromStatus(st, m.interval)
 
-	healthy, total := 0, 0
-	for _, ls := range st.Listeners {
-		for _, be := range ls.Backends {
-			total++
-			if be.Healthy {
-				healthy++
-			}
-		}
-	}
+	healthy, total := uniqueBackendHealth(st)
 	fmt.Fprintf(&b, "uptime %s   sessions %d   backends %d/%d up   in %s/s (%.0f pps)   out %s/s (%.0f pps)\n\n",
 		st.Uptime, st.Sessions.Active, healthy, total,
 		humanBytes(tv.InBPS), tv.InPPS, humanBytes(tv.OutBPS), tv.OutPPS)
@@ -260,6 +252,31 @@ func (m model) viewClients() string {
 	}
 	b.WriteString(dimStyle.Render("\nc: dashboard  s: sort column  r: reverse  q: quit"))
 	return b.String()
+}
+
+// uniqueBackendHealth counts DISTINCT backend addresses across listeners:
+// the same address probed by several listeners (e.g. a zero-traffic watchdog
+// alongside the production listener) is one backend, not two. It counts as up
+// when any listener reports it healthy — per-listener disagreement stays
+// visible in each listener's own row.
+func uniqueBackendHealth(st *admin.Status) (healthy, total int) {
+	up := make(map[string]bool)
+	for _, ls := range st.Listeners {
+		for _, be := range ls.Backends {
+			if h, seen := up[be.Addr]; seen {
+				up[be.Addr] = h || be.Healthy
+				continue
+			}
+			up[be.Addr] = be.Healthy
+		}
+	}
+	for _, h := range up {
+		total++
+		if h {
+			healthy++
+		}
+	}
+	return healthy, total
 }
 
 func backendsOf(st *admin.Status, name string) []admin.BackendStatus {
