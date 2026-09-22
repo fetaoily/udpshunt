@@ -42,6 +42,11 @@ nfpms:
     # Match ExecStart in packaging/systemd/udpshunt.service and the manual
     # install instructions in the README.
     bindir: /usr/local/bin
+    scripts:
+      # Non-fatal systemctl handling: enable+start on install, try-restart on
+      # upgrade, reason printed when the service fails to start.
+      postinstall: packaging/scripts/postinstall.sh
+      postremove: packaging/scripts/postremove.sh
     contents:
       - src: packaging/systemd/udpshunt.service
         dst: /usr/lib/systemd/system/udpshunt.service

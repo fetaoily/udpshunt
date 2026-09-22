@@ -29,13 +29,20 @@ Download the package for your platform from the release page, then:
     # Alpine
     apk add --allow-untrusted ./udpshunt_<version>_amd64.apk
 
-    sudo systemctl enable --now udpshunt
-
 Each package installs the binary at `/usr/bin/udpshunt`, the systemd unit at
 `/usr/lib/systemd/system/udpshunt.service`, and a starter config at
 `/etc/udpshunt/udpshunt.yaml`. The config is a conffile (`%config(noreplace)`
 on rpm): package upgrades never overwrite a config you have edited. Alpine
 ships the systemd unit too, but Alpine itself runs OpenRC — adapt as needed.
+
+On systemd hosts the package post-install script handles the service
+automatically (v0.1.8 and later): a fresh install enables and starts it with
+the starter (loopback demo) config, an upgrade restarts it only if it was
+running (a stopped service stays stopped), and if the service fails to start
+the install output prints the systemd status plus the last journal lines —
+the failure reason, without a second command. Removing the package stops and
+disables the service and keeps the config file. On hosts without systemctl
+the scriptlet skips service setup silently.
 
 ### macOS (Homebrew)
 
