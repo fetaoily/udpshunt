@@ -100,9 +100,13 @@ type Sample struct {
 }
 
 type BackendStatus struct {
-	Addr     string `json:"addr"`
-	Healthy  bool   `json:"healthy"`
-	Sessions int64  `json:"sessions"`
+	Addr            string `json:"addr"`
+	Healthy         bool   `json:"healthy"`
+	Suspect         bool   `json:"suspect"`
+	Sessions        int64  `json:"sessions"`
+	ErrCount        int64  `json:"err_count"`
+	LastErrorSource string `json:"last_error,omitempty"`
+	DownConfirmBy   string `json:"confirmed_by,omitempty"`
 }
 
 type SessionsStatus struct {

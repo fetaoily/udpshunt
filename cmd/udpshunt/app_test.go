@@ -19,6 +19,7 @@ import (
 	"go.uber.org/goleak"
 
 	"github.com/fetaoily/udpshunt/internal/admin"
+	"github.com/fetaoily/udpshunt/internal/balancer"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/webui"
 )
@@ -547,5 +548,199 @@ func TestUIServesBuiltSPA(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "<div id=\"app\">") {
 		t.Fatalf("/ui/ does not serve the SPA shell: %.200s", body)
+	}
+}
+
+// startEchoCtl is an echo backend the test can kill on demand (unlike the
+// t.Cleanup-managed startEcho).
+func startEchoCtl(t *testing.T) (addr string, stop func()) {
+	t.Helper()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 65536)
+		for {
+			n, from, err := pc.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			_, _ = pc.WriteToUDP(append([]byte("echo:"), buf[:n]...), from)
+		}
+	}()
+	return pc.LocalAddr().String(), func() { pc.Close(); <-done }
+}
+
+func onDownCfg(t *testing.T, backend, onDown string, timeout time.Duration) string {
+	t.Helper()
+	pol := ""
+	if onDown != "" {
+		pol = "    on_down: " + onDown + "\n"
+	}
+	return writeCfg(t, fmt.Sprintf(`
+listeners:
+  - name: L1
+    bind: 127.0.0.1:0
+    backends: [%s]
+%s    session_timeout: %s
+    health_check:
+      mode: raw
+      payload: "70696e67"
+      interval: 100ms
+      timeout: 60ms
+      rise: 1
+      fall: 2
+`, backend, pol, timeout))
+}
+
+// waitBackendDown polls /status-derived state until addr is down.
+func waitBackendDown(t *testing.T, app *App, addr string) admin.Status {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		st := app.Status()
+		for _, l := range st.Listeners {
+			for _, b := range l.Backends {
+				if b.Addr == addr && !b.Healthy {
+					return st
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("backend did not go down in time")
+	return admin.Status{}
+}
+
+func TestOnDownDrainKeepsSessions(t *testing.T) {
+	backend, kill := startEchoCtl(t)
+	p := onDownCfg(t, backend, "drain", 400*time.Millisecond)
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := roundTripUDP(t, app.listeners["L1"].Addr(), "ping"); err != nil || got != "echo:ping" {
+		t.Fatalf("setup round trip: %q %v", got, err)
+	}
+	kill() // probes start failing: suspect at fall, probe-confirm down
+
+	// app tests bypass main(): no idle reaper runs unless the test starts
+	// one. Drain expiry depends on it (session_timeout must be enforced).
+	reapCtx, stopReaper := context.WithCancel(context.Background())
+	defer stopReaper()
+	app.mgr.Start(reapCtx, 20*time.Millisecond)
+
+	st := waitBackendDown(t, app, backend)
+	for _, b := range st.Listeners[0].Backends {
+		if b.Addr == backend && b.Sessions == 0 {
+			t.Fatal("drain must keep live sessions after down")
+		}
+	}
+	// Sessions expire via session_timeout, not by eviction.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && app.mgr.Count() > 0 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if app.mgr.Count() != 0 {
+		t.Fatal("drained sessions must expire via session timeout")
+	}
+	evs := app.events.List()
+	sawDrain := false
+	for _, e := range evs {
+		if e.Kind == "backend_down" && strings.Contains(e.Detail, "policy=drain") {
+			sawDrain = true
+		}
+	}
+	if !sawDrain {
+		t.Fatalf("backend_down event must carry policy=drain, events: %+v", evs)
+	}
+}
+
+func TestOnDownCloseClosesSessions(t *testing.T) {
+	backend, kill := startEchoCtl(t)
+	p := onDownCfg(t, backend, "", time.Minute) // absent = close
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := roundTripUDP(t, app.listeners["L1"].Addr(), "ping"); err != nil {
+		t.Fatal(err)
+	}
+	kill()
+	waitBackendDown(t, app, backend)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && app.mgr.Count() > 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if app.mgr.Count() != 0 {
+		t.Fatal("close policy must close sessions on down")
+	}
+}
+
+func TestOnDownHotReloadSwitchesPolicy(t *testing.T) {
+	backend, kill := startEchoCtl(t)
+	pDrain := onDownCfg(t, backend, "drain", 30*time.Second)
+	app, _ := newApp(t, pDrain)
+	if err := app.Apply(context.Background(), mustLoad(t, pDrain)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := roundTripUDP(t, app.listeners["L1"].Addr(), "ping"); err != nil {
+		t.Fatal(err)
+	}
+	// Same bind: reload takes the updateListenerLocked path (no restart).
+	pClose := onDownCfg(t, backend, "close", 30*time.Second)
+	if err := app.Apply(context.Background(), mustLoad(t, pClose)); err != nil {
+		t.Fatal(err)
+	}
+	kill()
+	waitBackendDown(t, app, backend)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && app.mgr.Count() > 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if app.mgr.Count() != 0 {
+		t.Fatal("policy must follow the reloaded config (close), not the startup config")
+	}
+}
+
+func TestStatusAttributionFields(t *testing.T) {
+	dead := deadAddr(t)
+	p := onDownCfg(t, dead, "", time.Minute)
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	st := waitBackendDown(t, app, dead)
+	var b admin.BackendStatus
+	for _, bb := range st.Listeners[0].Backends {
+		if bb.Addr == dead {
+			b = bb
+		}
+	}
+	if b.DownConfirmBy != balancer.SrcProbe {
+		t.Fatalf("confirmed_by = %q, want probe", b.DownConfirmBy)
+	}
+	if b.ErrCount < 3 { // fall 2 + 1 confirming probe failure
+		t.Fatalf("err_count = %d, want >= 3", b.ErrCount)
+	}
+	// Events: suspect then attributed down.
+	kinds := map[string]bool{}
+	for _, e := range app.events.List() {
+		kinds[e.Kind] = true
+	}
+	if !kinds["backend_suspect"] {
+		t.Fatal("backend_suspect event missing")
+	}
+	sawConfirm := false
+	for _, e := range app.events.List() {
+		if e.Kind == "backend_down" && strings.Contains(e.Detail, "confirmed_by=probe") {
+			sawConfirm = true
+		}
+	}
+	if !sawConfirm {
+		t.Fatal("backend_down event must carry confirmed_by=probe")
 	}
 }

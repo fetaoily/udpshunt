@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fetaoily/udpshunt/internal/admin"
@@ -31,6 +32,12 @@ type App struct {
 	reqLog      *requestlog.Logger
 	clientStats *clientstats.Table
 
+	// onDown maps listener name -> on_down policy. Copy-on-write atomic:
+	// state-change callbacks fire while Apply/updateListenerLocked holds
+	// a.mu (bal.Snapshot may flip a suspect window mid-reload), so the
+	// callback MUST read policies here and never take a.mu.
+	onDown atomic.Pointer[map[string]string]
+
 	mu        sync.Mutex
 	cfg       config.Config
 	started   time.Time
@@ -51,7 +58,7 @@ type App struct {
 
 func NewApp(cfgPath string, logger *slog.Logger) *App {
 	met := metrics.New()
-	return &App{
+	a := &App{
 		cfgPath:   cfgPath,
 		logger:    logger,
 		met:       met,
@@ -67,6 +74,8 @@ func NewApp(cfgPath string, logger *slog.Logger) *App {
 		runDone:   map[string]chan struct{}{},
 		lctxs:     map[string]context.Context{},
 	}
+	a.onDown.Store(&map[string]string{})
+	return a
 }
 
 func healthEnabled(hc config.HealthCheck) bool { return hc.Mode == "raw" || hc.Mode == "dns" }
@@ -119,6 +128,32 @@ func hasBackend(addrs []string, addr string) bool {
 	return false
 }
 
+// setOnDownLocked stores name's policy in the copy-on-write map. Callers
+// hold a.mu (single writer); readers are state-change callbacks.
+func (a *App) setOnDownLocked(name, policy string) {
+	m := *a.onDown.Load()
+	next := make(map[string]string, len(m)+1)
+	for k, v := range m {
+		next[k] = v
+	}
+	if policy == "" {
+		policy = "close"
+	}
+	next[name] = policy
+	a.onDown.Store(&next)
+}
+
+func (a *App) deleteOnDownLocked(name string) {
+	m := *a.onDown.Load()
+	next := make(map[string]string, len(m))
+	for k, v := range m {
+		if k != name {
+			next[k] = v
+		}
+	}
+	a.onDown.Store(&next)
+}
+
 func (a *App) startListenerLocked(ctx context.Context, lc config.Listener) error {
 	bal := balancer.New(lc.Backends, balancer.Options{
 		Balance:      lc.Balance,
@@ -127,16 +162,38 @@ func (a *App) startListenerLocked(ctx context.Context, lc config.Listener) error
 		Fall:         lc.HealthCheck.Fall,
 		Counts:       func(addr string) int64 { return a.mgr.BackendCount(lc.Name, addr) },
 	})
+	a.setOnDownLocked(lc.Name, lc.OnDown)
 	bal.SetOnStateChange(func(t balancer.Transition) {
-		healthy := t.To != balancer.StateDown
-		a.met.SetBackendHealthy(lc.Name, t.Addr, healthy)
-		if healthy {
+		// Runs on data-path and admin goroutines, and under a.mu during
+		// reloads (Snapshot fires passive transitions). No a.mu here.
+		a.met.SetBackendHealthy(lc.Name, t.Addr, t.To != balancer.StateDown)
+		switch {
+		case t.To == balancer.StateSuspect:
+			a.events.Add("backend_suspect", fmt.Sprintf(
+				"%s %s errors=%d last_error=%s", lc.Name, t.Addr, t.Errors, t.LastSource))
+			a.logger.Warn("backend suspect", "listener", lc.Name, "backend", t.Addr,
+				"errors", t.Errors, "last_error", t.LastSource)
+		case t.To == balancer.StateDown:
+			if pol, ok := (*a.onDown.Load())[lc.Name]; ok && pol == "drain" {
+				n := a.mgr.BackendCount(lc.Name, t.Addr)
+				a.events.Add("backend_down", fmt.Sprintf(
+					"%s %s policy=drain draining=%d confirmed_by=%s errors=%d last_error=%s",
+					lc.Name, t.Addr, n, t.Source, t.Errors, t.LastSource))
+				a.logger.Info("backend marked down, sessions draining", "listener", lc.Name,
+					"backend", t.Addr, "draining", n, "confirmed_by", t.Source)
+				return
+			}
+			n := a.mgr.CloseBackend(lc.Name, t.Addr)
+			a.events.Add("backend_down", fmt.Sprintf(
+				"%s %s closed=%d confirmed_by=%s errors=%d last_error=%s",
+				lc.Name, t.Addr, n, t.Source, t.Errors, t.LastSource))
+			a.logger.Info("backend marked down, sessions closed", "listener", lc.Name,
+				"backend", t.Addr, "sessions", n, "confirmed_by", t.Source)
+		case t.From == balancer.StateSuspect && t.To == balancer.StateHealthy:
+			a.events.Add("backend_suspect_cleared", fmt.Sprintf("%s %s by=%s", lc.Name, t.Addr, t.Source))
+		default: // Down -> Healthy recovery
 			a.events.Add("backend_up", lc.Name+" "+t.Addr)
-			return
 		}
-		n := a.mgr.CloseBackend(lc.Name, t.Addr)
-		a.events.Add("backend_down", fmt.Sprintf("%s %s closed=%d", lc.Name, t.Addr, n))
-		a.logger.Info("backend marked down, sessions closed", "listener", lc.Name, "backend", t.Addr, "sessions", n)
 	})
 	l, err := listener.New(lc.Name, lc, bal, a.mgr, a.logger, a.met.ForListener(lc.Name), a.reqLog, a.clientStats)
 	if err != nil {
@@ -180,6 +237,9 @@ func (a *App) startProbeLocked(ctx context.Context, lc config.Listener) {
 }
 
 func (a *App) updateListenerLocked(lc config.Listener) {
+	// Publish the (possibly changed) policy before Snapshot below: it can
+	// fire suspect/down transitions, which must see the new config's policy.
+	a.setOnDownLocked(lc.Name, lc.OnDown)
 	bal := a.balancers[lc.Name]
 	// spec §3: a backend leaving the pool terminates its sessions. Repool
 	// FIRST, so Pick can no longer select a departing backend, and only
@@ -238,6 +298,7 @@ func (a *App) stopListenerLocked(name string) {
 	delete(a.cancels, name)
 	delete(a.runDone, name)
 	delete(a.lctxs, name)
+	a.deleteOnDownLocked(name)
 }
 
 // Reload loads the config file and applies it. On failure the previous
@@ -301,7 +362,10 @@ func (a *App) Status() admin.Status {
 		for _, bt := range bal.Snapshot() {
 			n := counts[bt.Addr]
 			total += n
-			bs = append(bs, admin.BackendStatus{Addr: bt.Addr, Healthy: bt.Healthy, Sessions: n})
+			bs = append(bs, admin.BackendStatus{
+				Addr: bt.Addr, Healthy: bt.Healthy, Suspect: bt.Suspect, Sessions: n,
+				ErrCount: bt.ErrCount, LastErrorSource: bt.LastErrorSource, DownConfirmBy: bt.DownConfirmBy,
+			})
 		}
 		// Report the bind actually running when known; a.cfg may be stale
 		// after a partially failed Apply.
