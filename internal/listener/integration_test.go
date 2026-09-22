@@ -267,3 +267,32 @@ func TestUpdateTimeoutAppliesToNewSessions(t *testing.T) {
 		t.Fatal("new timeout must apply to sessions created after UpdateTimeout")
 	}
 }
+
+func stateOf(bal *balancer.Balancer, addr string) balancer.BackendState {
+	for _, st := range bal.Snapshot() {
+		if st.Addr == addr {
+			return st
+		}
+	}
+	return balancer.BackendState{}
+}
+
+// TestRelayReadErrorAttributed: a session socket read error on a dead
+// backend surfaces as LastErrorSource=relay_read (Linux: ICMP-derived).
+func TestRelayReadErrorAttributed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows UDP sockets never surface ICMP port-unreachable as read errors")
+	}
+	dead := deadBackendAddr(t)
+	lc := config.Listener{Name: "attr", Bind: "127.0.0.1:0", Backends: []string{dead}, SessionTimeout: config.Duration(time.Minute)}
+	l, bal, _ := newStack(t, lc, 0)
+
+	client := testClient(t)
+	for i := 0; i < 3; i++ { // feed errors until suspect so the streak is recorded
+		_, _ = client.WriteToUDP([]byte("ping"), l.Addr())
+		time.Sleep(50 * time.Millisecond)
+	}
+	eventually(t, 5*time.Second, "relay_read error attributed", func() bool {
+		return stateOf(bal, dead).LastErrorSource == balancer.SrcRelayRead
+	})
+}

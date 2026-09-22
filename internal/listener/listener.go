@@ -286,8 +286,10 @@ func (l *Listener) downstream(s *session.Session) {
 			if errors.Is(werr, net.ErrClosed) {
 				return
 			}
-			l.met.BackendError(s.Backend)
-			l.bal.ReportError(s.Backend, balancer.SrcRelayRead)
+			// Client-direction failure (typically a gone NAT mapping): the
+			// client is unreachable, not the backend — never bill it to
+			// backend health (spec G4). Drop the session; nothing else.
+			l.logger.Debug("client write failed, dropping session", "client", s.Client, "err", werr)
 			l.mgr.Remove(l.name, s.Client)
 			return
 		}
