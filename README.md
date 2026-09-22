@@ -36,13 +36,15 @@ on rpm): package upgrades never overwrite a config you have edited. Alpine
 ships the systemd unit too, but Alpine itself runs OpenRC — adapt as needed.
 
 On systemd hosts the package post-install script handles the service
-automatically (v0.1.8 and later): a fresh install enables and starts it with
-the starter (loopback demo) config, an upgrade restarts it only if it was
-running (a stopped service stays stopped), and if the service fails to start
-the install output prints the systemd status plus the last journal lines —
-the failure reason, without a second command. Removing the package stops and
-disables the service and keeps the config file. On hosts without systemctl
-the scriptlet skips service setup silently.
+automatically (v0.1.8 and later): a fresh install enables it (start it
+yourself once the config is right), an upgrade restarts it only if it was
+running (a stopped service stays stopped), and if that restart leaves the
+service dead the install output prints the systemd status plus the last
+journal lines — the failure reason, without a second command. The same
+reason is always available at runtime via `systemctl status udpshunt`
+(udpshunt prints `udpshunt: <reason>` to the journal on startup failure).
+Removing the package stops and disables the service and keeps the config
+file. On hosts without systemctl the scriptlet skips service setup silently.
 
 ### macOS (Homebrew)
 

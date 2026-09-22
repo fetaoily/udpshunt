@@ -38,10 +38,9 @@ esac
 
 if [ "$fresh" = 1 ]; then
     systemctl enable udpshunt >/dev/null 2>&1 || true
-    systemctl start udpshunt >/dev/null 2>&1 || true
-    echo "udpshunt installed, enabled and started (starter config: loopback demo listener)."
+    echo "udpshunt installed and enabled (starter config: loopback demo listener)."
     echo "  config: /etc/udpshunt/udpshunt.yaml"
-    report_if_dead
+    echo "  start:  systemctl start udpshunt   (systemctl status udpshunt shows the reason if it fails)"
 else
     was_active=0
     systemctl is-active --quiet udpshunt && was_active=1
