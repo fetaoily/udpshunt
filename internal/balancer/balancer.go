@@ -476,9 +476,13 @@ func (b *Balancer) Snapshot() []BackendState {
 		if v := be.downConfirm.Load(); v != nil {
 			confirm = *v
 		}
+		var suspectSince int64
+		if suspect {
+			suspectSince = be.suspectSince.Load()
+		}
 		out = append(out, BackendState{
 			Addr: be.addr, Healthy: be.healthy.Load(), Suspect: suspect,
-			SuspectSince: be.suspectSince.Load(), ErrCount: be.errCount.Load(),
+			SuspectSince: suspectSince, ErrCount: be.errCount.Load(),
 			LastErrorSource: last, DownConfirmBy: confirm,
 		})
 	}

@@ -617,7 +617,7 @@ func waitBackendDown(t *testing.T, app *App, addr string) admin.Status {
 
 func TestOnDownDrainKeepsSessions(t *testing.T) {
 	backend, kill := startEchoCtl(t)
-	p := onDownCfg(t, backend, "drain", 400*time.Millisecond)
+	p := onDownCfg(t, backend, "drain", time.Second)
 	app, _ := newApp(t, p)
 	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
 		t.Fatal(err)
@@ -690,10 +690,14 @@ func TestOnDownHotReloadSwitchesPolicy(t *testing.T) {
 	if _, err := roundTripUDP(t, app.listeners["L1"].Addr(), "ping"); err != nil {
 		t.Fatal(err)
 	}
+	addrBefore := app.listeners["L1"].Addr()
 	// Same bind: reload takes the updateListenerLocked path (no restart).
 	pClose := onDownCfg(t, backend, "close", 30*time.Second)
 	if err := app.Apply(context.Background(), mustLoad(t, pClose)); err != nil {
 		t.Fatal(err)
+	}
+	if got := app.listeners["L1"].Addr(); got != addrBefore {
+		t.Fatalf("reload must update in place (bind unchanged), got %v then %v", addrBefore, got)
 	}
 	kill()
 	waitBackendDown(t, app, backend)
