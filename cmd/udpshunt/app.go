@@ -271,6 +271,15 @@ func (a *App) updateListenerLocked(lc config.Listener) {
 }
 
 func (a *App) stopListenerLocked(name string) {
+	// Detach the state-change callback first: an in-flight probe from the
+	// old prober can report up to one timeout after Stop, and this callback
+	// — keyed by listener name — would close the sessions of a same-named
+	// restarted listener. Joining the prober instead would block under a.mu
+	// for up to the probe timeout; detaching is O(1) and makes the late
+	// report inert.
+	if bal, ok := a.balancers[name]; ok {
+		bal.SetOnStateChange(nil)
+	}
 	if cancel, ok := a.cancels[name]; ok {
 		cancel()
 	}

@@ -748,3 +748,55 @@ func TestStatusAttributionFields(t *testing.T) {
 		t.Fatal("backend_down event must carry confirmed_by=probe")
 	}
 }
+
+// A stopped listener's balancer must have its state-change callback detached:
+// an in-flight probe from the old prober can report up to one timeout after
+// Stop, and the old callback — keyed by listener name — would close the
+// sessions of a same-named RESTARTED listener.
+func TestStoppedListenerCallbackDetached(t *testing.T) {
+	backend, kill := startEchoCtl(t)
+	defer kill()
+	p := writeCfg(t, fmt.Sprintf(`
+listeners:
+  - name: L1
+    bind: 127.0.0.1:0
+    backends: [%s]
+    session_timeout: 60s
+`, backend))
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	bal := app.balancers["L1"]
+	app.mu.Unlock()
+
+	// Stop L1 by applying a config that replaces it with L2 (config
+	// validation requires at least one listener); the stale-prober window
+	// is exactly here: an in-flight probe reports on bal after this
+	// returns, and a same-named restart would be the victim.
+	replace := writeCfg(t, fmt.Sprintf(`
+listeners:
+  - name: L2
+    bind: 127.0.0.1:0
+    backends: [%s]
+    session_timeout: 60s
+`, backend))
+	if err := app.Apply(context.Background(), mustLoad(t, replace)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the late probe report: suspect + probe error confirms down,
+	// which would fire the (formerly live) callback.
+	bal.ReportError(backend, balancer.SrcDial)
+	bal.ReportError(backend, balancer.SrcDial)
+	bal.ReportError(backend, balancer.SrcDial)
+	bal.ReportError(backend, balancer.SrcProbe)
+
+	for _, e := range app.events.List() {
+		if e.Kind == "backend_suspect" || e.Kind == "backend_down" || e.Kind == "backend_up" {
+			t.Fatalf("stopped listener's balancer must not fire callbacks: %+v", e)
+		}
+	}
+}
+
