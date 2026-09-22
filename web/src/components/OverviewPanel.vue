@@ -28,10 +28,18 @@ const outPps = computed(() => sumRate(props.status, 'out'))
 const inBps = computed(() => humanBytes(sumRate(props.status, 'bytes_in')))
 const outBps = computed(() => humanBytes(sumRate(props.status, 'bytes_out')))
 
+// Distinct backend addresses across listeners: the same address probed by
+// several listeners (e.g. a watchdog alongside production) is one backend.
+// An address counts as up when any listener reports it healthy; per-listener
+// disagreement stays visible in each listener's own card.
 function sumBackends(st) {
-  let healthy = 0, total = 0
-  for (const l of st?.listeners ?? []) for (const b of l.backends ?? []) { total++; if (b.healthy) healthy++ }
-  return { healthy, total }
+  const up = new Map()
+  for (const l of st?.listeners ?? []) for (const b of l.backends ?? []) {
+    up.set(b.addr, (up.get(b.addr) ?? false) || b.healthy)
+  }
+  let healthy = 0
+  for (const h of up.values()) if (h) healthy++
+  return { healthy, total: up.size }
 }
 function sumRate(st, key) {
   let v = 0
