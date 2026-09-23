@@ -417,6 +417,24 @@ func TestConcurrentRecord(t *testing.T) {
 	}
 }
 
+func TestFilePrefixSeparatesInstances(t *testing.T) {
+	dir := t.TempDir()
+	c := newFakeClock(t)
+	a := New(Options{Dir: dir, FilePrefix: "a-clients-", SnapshotInterval: 30 * time.Second, TickEvery: time.Hour, Clock: c.Now})
+	a.PacketIn(net.IPv4(1, 2, 3, 4), 10)
+	a.writeSnapshot(c.Now().Format(dayFormat))
+	b := New(Options{Dir: dir, FilePrefix: "b-clients-", SnapshotInterval: 30 * time.Second, TickEvery: time.Hour, Clock: c.Now})
+	rows, _, _ := b.Top("requests", true, 10)
+	if len(rows) != 0 {
+		t.Fatalf("prefixed instance must not load the other prefix's snapshot, got %v", rows)
+	}
+	// Default prefix keeps the historical name.
+	d := New(Options{Dir: dir, SnapshotInterval: time.Hour, TickEvery: time.Hour, Clock: c.Now})
+	if d.pathFor("2026-01-02") != filepath.Join(dir, "udpshunt-clients-2026-01-02.jsonl") {
+		t.Fatalf("default prefix changed: %s", d.pathFor("2026-01-02"))
+	}
+}
+
 func TestNilTableIsNoop(t *testing.T) {
 	var tab *Table
 	tab.PacketIn(ip(t, "10.0.0.1"), 1)

@@ -29,7 +29,6 @@ import (
 
 const (
 	dayFormat  = "2006-01-02"
-	filePrefix = "udpshunt-clients-"
 	fileSuffix = ".jsonl"
 	shardCount = 256
 	// rateAlpha is the EWMA smoothing factor: half of each new 1s sample.
@@ -39,6 +38,7 @@ const (
 // Options configure the stats table.
 type Options struct {
 	Dir              string
+	FilePrefix       string        // snapshot filename prefix, default "udpshunt-clients-"
 	RetentionDays    int           // default 30
 	MaxIPs           int           // default 65536
 	SnapshotInterval time.Duration // default 60s
@@ -108,7 +108,7 @@ func ipLess(a, b key) bool {
 }
 
 func (t *Table) pathFor(day string) string {
-	return filepath.Join(t.opts.Dir, filePrefix+day+fileSuffix)
+	return filepath.Join(t.opts.Dir, t.opts.FilePrefix+day+fileSuffix)
 }
 
 // stat holds one IP's counters. All fields are plain values guarded by the
@@ -165,6 +165,9 @@ type Table struct {
 // the returned Table is disabled: every method is a no-op and the proxy
 // keeps running (a broken stats sink must never take the data path down).
 func New(opts Options) *Table {
+	if opts.FilePrefix == "" {
+		opts.FilePrefix = "udpshunt-clients-"
+	}
 	if opts.RetentionDays <= 0 {
 		opts.RetentionDays = 30
 	}
@@ -204,8 +207,8 @@ func New(opts Options) *Table {
 	t.prevSnap = now
 	// Prune first: expired files must be deleted, not swept into fresh
 	// gzip copies. Then compress what a crash left behind.
-	dailyfile.Prune(opts.Dir, filePrefix, fileSuffix, t.day, opts.RetentionDays, t.logger)
-	dailyfile.SweepStale(opts.Dir, filePrefix, fileSuffix, t.day, t.logger)
+	dailyfile.Prune(opts.Dir, opts.FilePrefix, fileSuffix, t.day, opts.RetentionDays, t.logger)
+	dailyfile.SweepStale(opts.Dir, opts.FilePrefix, fileSuffix, t.day, t.logger)
 	t.removeTempFiles()
 	t.loadSnapshot(t.day)
 	go t.run()
@@ -501,7 +504,7 @@ func (t *Table) finalizeDay(newDay string) {
 	old := t.day
 	t.writeSnapshot(old)
 	go dailyfile.Compress(t.pathFor(old), t.logger)
-	dailyfile.Prune(t.opts.Dir, filePrefix, fileSuffix, newDay, t.opts.RetentionDays, t.logger)
+	dailyfile.Prune(t.opts.Dir, t.opts.FilePrefix, fileSuffix, newDay, t.opts.RetentionDays, t.logger)
 	for i := range t.shards {
 		sh := &t.shards[i]
 		sh.mu.Lock()
@@ -520,7 +523,7 @@ func (t *Table) writeSnapshot(day string) {
 	items := t.collect()
 	// Deterministic order (by IP bytes) so consecutive snapshots diff cleanly.
 	sort.Slice(items, func(i, j int) bool { return ipLess(items[i].k, items[j].k) })
-	tmp, err := os.CreateTemp(t.opts.Dir, filePrefix+"*.tmp")
+	tmp, err := os.CreateTemp(t.opts.Dir, t.opts.FilePrefix+"*.tmp")
 	if err != nil {
 		t.warn("client stats snapshot failed", "dir", t.opts.Dir, "err", err)
 		return
@@ -569,7 +572,7 @@ func (t *Table) removeTempFiles() {
 	}
 	for _, de := range entries {
 		name := de.Name()
-		if strings.HasPrefix(name, filePrefix) && strings.HasSuffix(name, ".tmp") {
+		if strings.HasPrefix(name, t.opts.FilePrefix) && strings.HasSuffix(name, ".tmp") {
 			_ = os.Remove(filepath.Join(t.opts.Dir, name))
 		}
 	}
