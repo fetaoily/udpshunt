@@ -147,7 +147,7 @@ func TestGracefulShutdown(t *testing.T) {
 	mgr := session.NewManager(0)
 	bal := balancer.New([]string{backend}, balancer.Options{})
 	lc := config.Listener{Name: "stop", Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
-	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, nil, nil)
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestMetricsCountTraffic(t *testing.T) {
 	lm := met.ForListener("met")
 	mgr := session.NewManager(0)
 	bal := balancer.New(lc.Backends, balancer.Options{})
-	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), lm, nil, nil)
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), lm, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestUpdateTimeoutAppliesToNewSessions(t *testing.T) {
 	lc := config.Listener{Name: "tt", Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
 	mgr := session.NewManager(0)
 	bal := balancer.New(lc.Backends, balancer.Options{})
-	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, nil, nil)
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -45,7 +45,7 @@ func benchStack(b *testing.B) (client *net.UDPConn, laddr *net.UDPAddr) {
 		Backends:       []string{pc.LocalAddr().String()},
 		SessionTimeout: config.Duration(time.Minute),
 	}
-	l, err := New(lc.Name, lc, bal, mgr, discardLogger(), nil, nil, nil)
+	l, err := New(lc.Name, lc, bal, mgr, discardLogger(), nil, nil, nil, nil, nil)
 	if err != nil {
 		b.Fatal(err)
 	}

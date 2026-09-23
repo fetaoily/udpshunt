@@ -195,7 +195,9 @@ func (a *App) startListenerLocked(ctx context.Context, lc config.Listener) error
 			a.events.Add("backend_up", lc.Name+" "+t.Addr)
 		}
 	})
-	l, err := listener.New(lc.Name, lc, bal, a.mgr, a.logger, a.met.ForListener(lc.Name), a.reqLog, a.clientStats)
+	// Blacklist wiring lands with the config loader (Task 6); enforcement is
+	// inert with a nil container.
+	l, err := listener.New(lc.Name, lc, bal, a.mgr, a.logger, a.met.ForListener(lc.Name), a.reqLog, a.clientStats, nil, nil)
 	if err != nil {
 		return err
 	}

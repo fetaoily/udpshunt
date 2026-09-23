@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/fetaoily/udpshunt/internal/balancer"
+	"github.com/fetaoily/udpshunt/internal/blocklist"
 	"github.com/fetaoily/udpshunt/internal/clientstats"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/requestlog"
@@ -77,7 +78,7 @@ func newStack(t *testing.T, lc config.Listener, maxSessions int64) (*Listener, *
 	t.Helper()
 	mgr := session.NewManager(maxSessions)
 	bal := balancer.New(lc.Backends, balancer.Options{})
-	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, nil, nil)
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +241,7 @@ func newStackWithLog(t *testing.T, lc config.Listener, maxSessions int64, rl *re
 	t.Helper()
 	mgr := session.NewManager(maxSessions)
 	bal := balancer.New(lc.Backends, balancer.Options{})
-	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, rl, nil)
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, rl, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +261,7 @@ func TestClientStatsCounting(t *testing.T) {
 	lc := config.Listener{Name: "cs", Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
 	mgr := session.NewManager(0)
 	bal := balancer.New(lc.Backends, balancer.Options{})
-	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, nil, stats)
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, nil, stats, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,5 +291,128 @@ func TestClientStatsCounting(t *testing.T) {
 	if row.IP != "127.0.0.1" || row.Requests != 1 || row.Responses != 1 ||
 		row.BytesIn != 5 || row.BytesOut != int64(len("echo:hello")) {
 		t.Fatalf("stats row wrong: %+v", row)
+	}
+}
+
+// blacklistStack is a dedicated stack (like TestGracefulShutdown's) with a
+// blocklist container, so tests can swap lists while the listener runs.
+func blacklistStack(t *testing.T, name string, rl *requestlog.Logger, bstats *clientstats.Table) (*Listener, *session.Manager, *blocklist.Container) {
+	t.Helper()
+	backend := startEcho(t)
+	lc := config.Listener{Name: name, Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
+	mgr := session.NewManager(0)
+	bal := balancer.New(lc.Backends, balancer.Options{})
+	bl := blocklist.NewContainer()
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, rl, nil, bl, bstats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Same LIFO teardown as newStack: cancel (stop receiving) -> CloseAll
+	// (unblock downstream readers) -> Close (release the frontend socket).
+	t.Cleanup(func() { _ = l.Close() })
+	t.Cleanup(func() { mgr.CloseAll() })
+	t.Cleanup(cancel)
+	go func() { _ = l.Run(ctx) }()
+	return l, mgr, bl
+}
+
+// blockClientAddr builds a list holding the client's own local address: a
+// real source spoof is impossible in a test, but blacklisting the client's
+// IP exercises the same code path a spoofed source would hit.
+func blockClientAddr(t *testing.T, cli *net.UDPConn) *blocklist.List {
+	t.Helper()
+	l, err := blocklist.New([]string{cli.LocalAddr().(*net.UDPAddr).IP.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+func TestBlacklistedPacketDropped(t *testing.T) {
+	bstats := clientstats.New(clientstats.Options{Dir: t.TempDir(), TickEvery: time.Hour, SnapshotInterval: time.Hour})
+	t.Cleanup(bstats.Stop)
+	l, mgr, bl := blacklistStack(t, "bl", nil, bstats)
+
+	cli := testClient(t)
+	cliIP := cli.LocalAddr().(*net.UDPAddr).IP.String()
+	bl.Swap(blockClientAddr(t, cli))
+
+	if _, err := cli.WriteToUDP([]byte("evil"), l.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	cli.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	buf := make([]byte, 65536)
+	if n, _, err := cli.ReadFromUDP(buf); err == nil {
+		t.Fatalf("blacklisted client must get no reply, got %q", buf[:n])
+	}
+	if mgr.Count() != 0 {
+		t.Fatal("blacklisted client must not create a session")
+	}
+
+	// Blocked stats recorded for that IP (poll briefly: PacketIn lands from
+	// the receive loop after the client has already given up waiting).
+	var row clientstats.Row
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		rows, _, _ := bstats.Top("requests", true, 10)
+		if len(rows) == 1 && rows[0].IP == cliIP && rows[0].Requests >= 1 {
+			row = rows[0]
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if row.IP != cliIP || row.Requests < 1 {
+		t.Fatalf("blocked stats missing for %s: %+v", cliIP, row)
+	}
+
+	// Unblock -> traffic flows again.
+	empty, err := blocklist.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bl.Swap(empty)
+	if got := roundTrip(t, cli, l.Addr(), "ping"); got != "echo:ping" {
+		t.Fatalf("after unblock: %q", got)
+	}
+}
+
+func TestLogBlockedWritesRequestLog(t *testing.T) {
+	dir := t.TempDir()
+	rl := requestlog.New(requestlog.Options{Dir: dir, RetentionDays: 30, FlushEvery: 5 * time.Millisecond})
+	t.Cleanup(rl.Stop)
+	logPath := filepath.Join(dir, "udpshunt-requests-"+time.Now().Format("2006-01-02")+".log")
+	l, _, bl := blacklistStack(t, "bl-log", rl, nil)
+
+	cli := testClient(t)
+	cliIP := cli.LocalAddr().(*net.UDPAddr).IP.String()
+	bl.Swap(blockClientAddr(t, cli))
+
+	l.UpdateLogBlocked(true)
+	if _, err := cli.WriteToUDP([]byte("evil"), l.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	lines := waitLines(t, logPath, 1)
+	last := lines[len(lines)-1]
+	// Backend is empty (no backend was selected), so the omitempty field is
+	// absent from the line entirely.
+	for _, want := range []string{`"listener":"bl-log"`, `"outcome":"blacklisted"`, `"client":"` + cliIP + `:`} {
+		if !strings.Contains(last, want) {
+			t.Fatalf("line %q missing %s", last, want)
+		}
+	}
+	if strings.Contains(last, `"backend"`) {
+		t.Fatalf("blocked line must have no backend, got %s", last)
+	}
+
+	// Default off again: another blocked packet must not log.
+	l.UpdateLogBlocked(false)
+	before := len(readLogLines(t, logPath))
+	if _, err := cli.WriteToUDP([]byte("evil2"), l.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond) // a few flush cycles
+	if after := len(readLogLines(t, logPath)); after != before {
+		t.Fatalf("log_blocked=false must not log: %d -> %d lines", before, after)
 	}
 }

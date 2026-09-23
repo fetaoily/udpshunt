@@ -16,6 +16,7 @@ func TestRegistryExposesMetrics(t *testing.T) {
 	lm.BackendOut("b:1", 1)
 	lm.BackendError("b:1")
 	lm.SessionCreated()
+	lm.Blacklisted(1)
 	m.SetBackendHealthy("t", "b:1", true)
 	m.IncReload()
 	m.IncReloadFailure()
@@ -37,6 +38,7 @@ func TestRegistryExposesMetrics(t *testing.T) {
 		"udpshunt_backend_healthy",
 		"udpshunt_backend_state_changes_total",
 		"udpshunt_sessions_created_total",
+		"udpshunt_blacklisted_packets_total",
 		"udpshunt_sessions_expired_total",
 		"udpshunt_sessions_rejected_total",
 		"udpshunt_sessions_active",
@@ -117,6 +119,7 @@ func TestNilListenerMetricsSafe(t *testing.T) {
 	lm.PacketsIn(1) // must not panic
 	lm.BackendError("b:1")
 	lm.SessionCreated()
+	lm.Blacklisted(1)
 }
 
 func TestForListenerReusesChildren(t *testing.T) {

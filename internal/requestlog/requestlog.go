@@ -26,6 +26,7 @@ const (
 	OutcomeNoBackend     = "no_backend"
 	OutcomeRejected      = "rejected"
 	OutcomeUpstreamError = "upstream_error"
+	OutcomeBlacklisted   = "blacklisted"
 )
 
 const (

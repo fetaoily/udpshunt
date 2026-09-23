@@ -24,6 +24,7 @@ type Metrics struct {
 	backendFlips *prometheus.CounterVec
 
 	sessionsCreated *prometheus.CounterVec
+	blacklisted     *prometheus.CounterVec
 	sessionStatsSet bool
 	reloads         prometheus.Counter
 	reloadFailures  prometheus.Counter
@@ -64,6 +65,9 @@ func New() *Metrics {
 		}, []string{"listener", "backend"}),
 		sessionsCreated: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
 			Name: "udpshunt_sessions_created_total", Help: "Sessions created.",
+		}, []string{"listener"}),
+		blacklisted: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+			Name: "udpshunt_blacklisted_packets_total", Help: "Packets dropped from blacklisted clients.",
 		}, []string{"listener"}),
 		reloads: promauto.With(r).NewCounter(prometheus.CounterOpts{
 			Name: "udpshunt_reloads_total", Help: "Successful config reloads.",
@@ -130,6 +134,11 @@ func (lm *ListenerMetrics) BackendError(backend string) {
 func (lm *ListenerMetrics) SessionCreated() {
 	if lm != nil {
 		lm.m.sessionsCreated.WithLabelValues(lm.name).Inc()
+	}
+}
+func (lm *ListenerMetrics) Blacklisted(n int) {
+	if lm != nil {
+		lm.m.blacklisted.WithLabelValues(lm.name).Add(float64(n))
 	}
 }
 

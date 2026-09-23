@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fetaoily/udpshunt/internal/balancer"
+	"github.com/fetaoily/udpshunt/internal/blocklist"
 	"github.com/fetaoily/udpshunt/internal/clientstats"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/metrics"
@@ -25,17 +28,21 @@ const maxPacketSize = 65536
 const defaultReadBuffer = 4 << 20 // 4 MiB
 
 type Listener struct {
-	name     string
-	pc       *net.UDPConn
-	io       *pktio.Conn
-	bal      *balancer.Balancer
-	mgr      *session.Manager
-	met      *metrics.ListenerMetrics
-	reqLog   *requestlog.Logger
-	stats    *clientstats.Table
-	timeout  time.Duration
-	logger   *slog.Logger
-	resolved map[string]*net.UDPAddr // backend address -> pre-resolved address
+	name         string
+	pc           *net.UDPConn
+	io           *pktio.Conn
+	bal          *balancer.Balancer
+	mgr          *session.Manager
+	met          *metrics.ListenerMetrics
+	reqLog       *requestlog.Logger
+	stats        *clientstats.Table
+	bl           *blocklist.Container
+	blockedStats *clientstats.Table
+	timeout      time.Duration
+	logger       *slog.Logger
+	resolved     map[string]*net.UDPAddr // backend address -> pre-resolved address
+
+	logBlocked atomic.Bool
 
 	mu        sync.Mutex // guards stopped, waiters, timeout and the wg.Add in startDownstream
 	stopped   bool       // set once draining: no new downstream goroutines
@@ -48,8 +55,10 @@ type Listener struct {
 // New binds the frontend UDP socket described by cfg.Bind and resolves every
 // backend address once so the receive loop never pays for DNS on new sessions.
 // met may be nil to run without metrics; reqLog may be nil to run without
-// the per-request file log; stats may be nil to run without client stats.
-func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.Manager, logger *slog.Logger, met *metrics.ListenerMetrics, reqLog *requestlog.Logger, stats *clientstats.Table) (*Listener, error) {
+// the per-request file log; stats may be nil to run without client stats;
+// bl may be nil to run without a blacklist; blockedStats may be nil to run
+// without the dedicated blocked-client accounting.
+func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.Manager, logger *slog.Logger, met *metrics.ListenerMetrics, reqLog *requestlog.Logger, stats *clientstats.Table, bl *blocklist.Container, blockedStats *clientstats.Table) (*Listener, error) {
 	addr, err := net.ResolveUDPAddr("udp", cfg.Bind)
 	if err != nil {
 		return nil, err
@@ -75,17 +84,19 @@ func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.
 		resolved[b] = ra
 	}
 	return &Listener{
-		name:     name,
-		pc:       pc,
-		io:       pktio.Wrap(pc),
-		bal:      bal,
-		mgr:      mgr,
-		met:      met,
-		reqLog:   reqLog,
-		stats:    stats,
-		timeout:  time.Duration(cfg.SessionTimeout),
-		logger:   logger.With("listener", name),
-		resolved: resolved,
+		name:         name,
+		pc:           pc,
+		io:           pktio.Wrap(pc),
+		bal:          bal,
+		mgr:          mgr,
+		met:          met,
+		reqLog:       reqLog,
+		stats:        stats,
+		bl:           bl,
+		blockedStats: blockedStats,
+		timeout:      time.Duration(cfg.SessionTimeout),
+		logger:       logger.With("listener", name),
+		resolved:     resolved,
 	}, nil
 }
 
@@ -106,6 +117,12 @@ func (l *Listener) UpdateTimeout(d time.Duration) {
 	l.mu.Lock()
 	l.timeout = d
 	l.mu.Unlock()
+}
+
+// UpdateLogBlocked toggles whether blacklisted (dropped) packets are written
+// to the request log. Default off.
+func (l *Listener) UpdateLogBlocked(v bool) {
+	l.logBlocked.Store(v)
 }
 
 // Run receives packets until ctx is cancelled. Cancellation stops the receive
@@ -141,6 +158,27 @@ func (l *Listener) Run(ctx context.Context) error {
 			l.met.PacketsIn(1)
 			l.met.BytesIn(sizes[i])
 			l.stats.PacketIn(addrs[i].IP, sizes[i])
+			if l.bl != nil {
+				// Hot path: one atomic list load + map probe, no locks.
+				if a, ok := netip.AddrFromSlice(addrs[i].IP); ok {
+					a = a.Unmap()
+					if l.bl.Blocked(a) {
+						l.met.Blacklisted(1)
+						l.blockedStats.PacketIn(addrs[i].IP, sizes[i])
+						if l.logBlocked.Load() && l.reqLog != nil {
+							l.reqLog.Record(requestlog.Entry{
+								Time:     time.Now(),
+								Listener: l.name,
+								Client:   addrs[i].String(),
+								Backend:  "",
+								Bytes:    sizes[i],
+								Outcome:  requestlog.OutcomeBlacklisted,
+							})
+						}
+						continue
+					}
+				}
+			}
 			l.handle(addrs[i], bufs[i][:sizes[i]])
 		}
 		if err != nil {
