@@ -197,50 +197,99 @@ var clientCols = []struct {
 	{"last", "last_seen"},
 }
 
-// clientColWidths are the fixed cell widths matching clientCols. Column
-// cells are padded with lipgloss styles (ANSI-aware), never Sprintf.
-var clientColWidths = []int{15, 7, 9, 7, 9, 9, 9, 9, 7}
+// clientMinWidths are the per-column display floors for short content;
+// wider content grows the column (clientWidths).
+var clientMinWidths = []int{15, 7, 9, 7, 9, 9, 9, 9, 7}
+
+// clientHeaderCell returns the header text for column i, with the sort
+// direction arrow on the active column (its rune counts toward the width).
+func clientHeaderCell(sortIdx, i int, asc bool) string {
+	label := clientCols[i].label
+	if i == sortIdx {
+		arrow := "▼"
+		if asc {
+			arrow = "▲"
+		}
+		label = arrow + label
+	}
+	return label
+}
+
+// clientCell returns row r's plain text for column i.
+func clientCell(r clientstats.Row, i int, now time.Time) string {
+	switch i {
+	case 0:
+		return r.IP
+	case 1:
+		return fmt.Sprintf("%d", r.Requests)
+	case 2:
+		return fmt.Sprintf("%.0f", r.PPSIn)
+	case 3:
+		return fmt.Sprintf("%d", r.Responses)
+	case 4:
+		return humanBytes(r.BPSIn) + "/s"
+	case 5:
+		return humanBytes(r.BPSOut) + "/s"
+	case 6:
+		return humanBytes(float64(r.BytesIn))
+	case 7:
+		return humanBytes(float64(r.BytesOut))
+	default:
+		return lastSeenAgo(r.LastSeen, now)
+	}
+}
+
+// clientWidths derives per-column widths from the actual header and rows:
+// the widest cell plus one space of gap, never below the floor. Dynamic
+// widths keep header and data aligned when counters grow past the floor,
+// byte totals reach four digits, or IPv6 addresses appear — a fixed width
+// made exact-fit neighbours render with no gap at all ("4.2 GiB653.8 MiB").
+func clientWidths(rows []clientstats.Row, sortIdx int, asc bool, now time.Time) []int {
+	w := make([]int, len(clientCols))
+	consider := func(i int, cell string) {
+		if n := len([]rune(cell)) + 1; n > w[i] {
+			w[i] = n
+		}
+	}
+	for i := range clientCols {
+		w[i] = clientMinWidths[i]
+		consider(i, clientHeaderCell(sortIdx, i, asc))
+	}
+	for _, r := range rows {
+		for i := range clientCols {
+			consider(i, clientCell(r, i, now))
+		}
+	}
+	return w
+}
 
 // clientHeader renders the header row, highlighting the active sort column
-// with a direction arrow.
-func clientHeader(sortIdx int, asc bool) string {
+// with a direction arrow. Numeric headers are right-aligned to sit above
+// their right-aligned values.
+func clientHeader(w []int, sortIdx int, asc bool) string {
 	var b strings.Builder
-	for i, c := range clientCols {
-		label := c.label
-		st := dimStyle
+	for i := range clientCols {
+		st := dimStyle.Width(w[i])
 		if i == sortIdx {
-			arrow := "▼"
-			if asc {
-				arrow = "▲"
-			}
-			label = arrow + label
 			st = titleStyle
 		}
-		b.WriteString(st.Width(clientColWidths[i]).Render(label))
+		if i > 0 {
+			st = st.Align(lipgloss.Right)
+		}
+		b.WriteString(st.Render(clientHeaderCell(sortIdx, i, asc)))
 	}
 	return b.String()
 }
 
 // clientRow renders one data row: IP left-aligned, numbers right-aligned.
-func clientRow(r clientstats.Row, now time.Time) string {
-	cells := []string{
-		r.IP,
-		fmt.Sprintf("%d", r.Requests),
-		fmt.Sprintf("%.0f", r.PPSIn),
-		fmt.Sprintf("%d", r.Responses),
-		humanBytes(r.BPSIn) + "/s",
-		humanBytes(r.BPSOut) + "/s",
-		humanBytes(float64(r.BytesIn)),
-		humanBytes(float64(r.BytesOut)),
-		lastSeenAgo(r.LastSeen, now),
-	}
+func clientRow(r clientstats.Row, w []int, now time.Time) string {
 	var b strings.Builder
-	for i, c := range cells {
-		st := lipgloss.NewStyle().Width(clientColWidths[i])
+	for i := range clientCols {
+		st := lipgloss.NewStyle().Width(w[i])
 		if i > 0 {
 			st = st.Align(lipgloss.Right)
 		}
-		b.WriteString(st.Render(c))
+		b.WriteString(st.Render(clientCell(r, i, now)))
 	}
 	return b.String()
 }

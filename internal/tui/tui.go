@@ -256,15 +256,16 @@ func (m model) viewClients() string {
 		scope = "   blocked"
 	}
 	fmt.Fprintf(&b, "tracked %d   evicted %d   sort %s %s%s\n\n", cs.Tracked, cs.Evicted, col.sort, dir, scope)
-	b.WriteString(clientHeader(m.sortIdx, m.sortAsc) + "\n")
 	const maxRows = 20
 	rows := cs.Rows
 	if len(rows) > maxRows {
 		rows = rows[:maxRows]
 	}
 	now := time.Now()
+	w := clientWidths(rows, m.sortIdx, m.sortAsc, now)
+	b.WriteString(clientHeader(w, m.sortIdx, m.sortAsc) + "\n")
 	for _, r := range rows {
-		b.WriteString(clientRow(r, now) + "\n")
+		b.WriteString(clientRow(r, w, now) + "\n")
 	}
 	if len(cs.Rows) > maxRows {
 		fmt.Fprintf(&b, dimStyle.Render("  ... %d more rows below\n"), len(cs.Rows)-maxRows)
