@@ -11,10 +11,13 @@
 
 - G1 拦截：黑名单内 IP 的数据包在转发前**静默丢弃**（UDP 无回应），不建会话。
 - G2 拉黑即断：IP 进入名单时，其**存量会话立即关闭**。
-- G3 静态配置：顶层 `blacklist` 配置段，精确 IP 与 CIDR 前缀，随 `/reload` 热加载。
+- G3 静态配置：顶层 `blacklist` 配置段，精确 IP 与 CIDR 前缀，随 `/reload` 热加载；
+  另支持独立拉黑文件（逗号分隔），与主配置条目取并集。
 - G4 运行时管理：admin API 增删查名单，运维从 clients 视图发现滥用即可拉黑。
 - G5 可观测：拦截计数（metrics + /status + TUI 头部）、增删事件；被拦包可选用
    request_log 记录（默认关闭）。
+- G6 被拦流量记账：被拦 IP 的包数/字节/速率/最后出现时间记入独立统计表，
+  与合法流量视图互不污染。
 
 ## 2. 非目标
 
@@ -32,15 +35,25 @@ blacklist:
   entries:            # 省略或空 = 名单为空，功能闲置
     - 203.0.113.7     # 精确 IP（内部规范化为 /32 或 /128）
     - 198.51.100.0/24 # CIDR
+  file: ""            # 可选：独立拉黑文件路径，逗号（及换行）分隔的条目
   log_blocked: false  # 默认 false：被拦包是否写 request_log（见 §8）
 ```
+
+少量条目直接写 `entries`；量大或需要独立维护时用 `file` 指向独立文件（如
+`/etc/udpshunt/blacklist.txt`，内容形如 `203.0.113.7,198.51.100.0/24`，逗号与
+换行均作分隔）。两个来源取**并集**，都属于"配置来源"（§7 的 union 模型中随
+reload 重建）。文件随启动与每次 `/reload` 重读，不做 inotify 实时监视。
 
 校验：每个条目用 `net/netip` 的 `ParsePrefix`（裸 IP 补 `/<w>`）或 `ParseAddr` 解析，
 非法即配置错误；`Is4In6` 统一 `Unmap()` 规范化；重复条目静默去重；IPv4/IPv6 均可，
 但必须与监听地址族匹配才可能命中（文档注明，不做转换）。
 
-`Blacklist` 配置结构体：`Entries []string`、`LogBlocked bool`（零值 false）。
-配置段整体缺省 = 空名单 + log_blocked=false，行为与无此功能一致。
+**fail-closed**：`file` 已配置但文件缺失或不可读 → 配置加载直接报错（拼错路径
+不应静默变成"无黑名单"）；文件内条目非法同样报错并指出文件名与行号。
+
+`Blacklist` 配置结构体：`Entries []string`、`File string`、`LogBlocked bool`
+（零值 false）。配置段整体缺省 = 空名单 + log_blocked=false，行为与无此功能
+一致。
 
 ## 4. 匹配器（新包 internal/blocklist）
 
@@ -66,8 +79,8 @@ func (c *Container) Blocked(a netip.Addr) bool // nil-safe：空容器返回 fal
 - `listener.New` 增参 `bl *blocklist.Container`（nil = 无此功能，跳过检查）。
 - `Run` 的批收循环内、`handle` 之前逐包检查：
   命中 → `met.Blacklisted(1)`（新计数器，带 listener 标签，与其他指标同风格）→
-  按 `log_blocked` 决定是否写 request_log（§8）→ `continue`（不进 client_stats、
-  不建会话、不进 forwarded 日志）。
+  被拦流量**记账**（见 §9 的独立统计表）→ 按 `log_blocked` 决定是否写
+  request_log（§8）→ `continue`（不建会话、不进 forwarded 日志）。
 - 客户端 IP 提取：`*net.UDPAddr` → `netip.Addr`（`Unmap()` 规范化后查表）。
 - `log_blocked` 开关随配置可变：Listener 以原子布尔持有（更新路径与
   `UpdateTimeout` 同款式），reload 生效。
@@ -124,11 +137,17 @@ App 持有：`blocklist *blocklist.Container`（全局一份，各 listener 共�
 
 - metrics：`udpshunt_blacklisted_packets_total`（counter，listener 标签，与其他
   per-listener 指标同风格）。
-- `/status`：顶层新增 `blacklist: {entries: N, blocked_packets: M}`。
+- **被拦流量记账**：被拦包按 IP 记入一张**独立的** clientstats 表（复用
+  `internal/clientstats` 实现，第二个实例：独立的 snapshot 文件前缀
+  `blocked-`，目录/保留期与 client_stats 共用配置，独立的 max_ips 预算）——
+  拉黑 IP 的包数/字节/速率/最后出现时间与合法流量表互不污染。需要
+  `clientstats.Options` 增加 `FilePrefix string`（默认空 = 现文件名，向后兼容）。
+- `/clients`：`?scope=blocked` 返回被拦表（默认 scope=normal，行为不变）；
+  `/status` 顶层新增 `blacklist: {entries: N, blocked_packets: M}`。
 - 事件：`blacklist_added` / `blacklist_removed`（含条目与来源）/ 
   `blacklist_enforced`（关存量会话数）。
-- TUI：头部在 `blocked_packets > 0` 时追加 `blocked N`；clients 视图不加标记
-  （被拦 IP 不再产生统计，视图保持合法流量语义）。
+- TUI：头部在 `blocked_packets > 0` 时追加 `blocked N`；clients 视图加 `b` 键
+  在 normal/blocked 两张表间切换（表头提示键位）。
 
 ## 10. 并发与不变量
 
@@ -141,13 +160,18 @@ App 持有：`blocklist *blocklist.Container`（全局一份，各 listener 共�
 
 - **blocklist**：解析/规范化（裸 IP↔前缀、Is4In6、去重、非法拒绝）；Blocked
   精确/前缀/跨地址族不命中；Entries 规范化往返；空名单。
-- **listener**：被拦 IP 的包不转发、不建会话、计数 +1；`log_blocked` 开关两种
-  情况的 request_log 行为；合法 IP 不受影响。
+- **listener**：被拦 IP 的包不转发、不建会话、计数 +1 且进被拦统计表
+  （按 IP 可查）；`log_blocked` 开关两种情况的 request_log 行为；合法 IP
+  不受影响、合法表无被拦 IP 条目。
 - **session**：CloseClients 按谓词关闭、计数正确、不误伤。
 - **admin/app**：GET/POST/DELETE 全流程（含 400）；拉黑立即关会话；reload 的
   union 语义（配置新增生效、运行时增删跨 reload 保留、配置删除但运行时也删过 →
   维持删除）；/status 字段。
-- **config**：条目校验表驱动（合法/非法/IP 带前缀长度/重复）。
+- **config**：条目校验表驱动（合法/非法/IP 带前缀长度/重复）；独立文件的
+  加载（逗号/换行分隔、与 entries 并集、文件缺失报错、文件内非法条目报错并带
+  文件名）。
+- **clientstats**：`FilePrefix` 选项——两个实例写各自的 snapshot 文件互不覆盖；
+  被拦表/合法表数据隔离（对同一 IP 分别记账互不串扰）。
 
 ## 12. 兼容性
 
