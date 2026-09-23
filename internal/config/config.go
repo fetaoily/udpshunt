@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/fetaoily/udpshunt/internal/blocklist"
 )
 
 // Duration wraps time.Duration so YAML accepts values like "60s".
@@ -38,6 +40,7 @@ type Config struct {
 	Admin       Admin       `yaml:"admin"`
 	RequestLog  RequestLog  `yaml:"request_log"`
 	ClientStats ClientStats `yaml:"client_stats"`
+	Blacklist   Blacklist   `yaml:"blacklist"`
 }
 
 type Listener struct {
@@ -102,6 +105,18 @@ type ClientStats struct {
 
 // IsEnabled reports whether client stats are on.
 func (c ClientStats) IsEnabled() bool { return c.Enabled != nil && *c.Enabled }
+
+// Blacklist configures the client IP blacklist: inline entries plus an
+// optional separate list file, re-read when the file's mtime changes. The
+// file is loaded fail-closed: a missing, unreadable or invalid list file is
+// a config error, never an empty blacklist. The zero value (section absent)
+// disables the feature.
+type Blacklist struct {
+	Entries       []string `yaml:"entries"`
+	File          string   `yaml:"file"`
+	WatchInterval Duration `yaml:"watch_interval"` // >= 0; 0 = no watch
+	LogBlocked    bool     `yaml:"log_blocked"`
+}
 
 // Load reads the YAML file at path, applies defaults, and validates the result.
 func Load(path string) (Config, error) {
@@ -295,6 +310,29 @@ func (c Config) Validate() error {
 		if c.ClientStats.SnapshotInterval < 0 {
 			return fmt.Errorf("client_stats.snapshot_interval must be >= 0")
 		}
+	}
+	// Blacklist validation is unconditional: the zero value (section absent)
+	// has no entries, no file and interval 0, so it passes trivially. The
+	// list file is read here and every entry validated — fail-closed: a bad
+	// path or a bad entry must reject the whole config.
+	for i, e := range c.Blacklist.Entries {
+		if _, err := blocklist.New([]string{e}); err != nil {
+			return fmt.Errorf("blacklist.entries[%d]: %w", i, err)
+		}
+	}
+	if c.Blacklist.File != "" {
+		fileEntries, err := blocklist.ReadFileEntries(c.Blacklist.File)
+		if err != nil {
+			return fmt.Errorf("blacklist.file %q: %w", c.Blacklist.File, err)
+		}
+		for _, e := range fileEntries {
+			if _, err := blocklist.New([]string{e}); err != nil {
+				return fmt.Errorf("blacklist.file %q: file entry %q: %w", c.Blacklist.File, e, err)
+			}
+		}
+	}
+	if c.Blacklist.WatchInterval < 0 {
+		return fmt.Errorf("blacklist.watch_interval must be >= 0")
 	}
 	switch c.Logging.Level {
 	case "debug", "info", "warn", "error":

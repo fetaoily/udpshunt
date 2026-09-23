@@ -432,3 +432,33 @@ func TestOnDownValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestBlacklistValidation(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "bl.txt")
+	os.WriteFile(good, []byte("203.0.113.7,198.51.100.0/24"), 0o600)
+	bad := filepath.Join(dir, "bad.txt")
+	os.WriteFile(bad, []byte("not-an-ip"), 0o600)
+
+	cases := map[string]struct {
+		yaml    string
+		wantErr bool
+	}{
+		"absent":              {baseListener + "blacklist:\n  entries: [203.0.113.7]\n", false},
+		"file and entries":    {baseListener + "blacklist:\n  entries: [192.0.2.1]\n  file: " + good + "\n", false},
+		"invalid entry":       {baseListener + "blacklist:\n  entries: [nope]\n", true},
+		"prefix on host bits": {baseListener + "blacklist:\n  entries: [10.0.0.1/24]\n", true},
+		"missing file":        {baseListener + "blacklist:\n  file: " + filepath.Join(dir, "nope.txt") + "\n", true},
+		"invalid in file":     {baseListener + "blacklist:\n  file: " + bad + "\n", true},
+		"negative watch":      {baseListener + "blacklist:\n  watch_interval: -1s\n", true},
+		"watch zero ok":       {baseListener + "blacklist:\n  watch_interval: 0s\n", false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.yaml))
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
