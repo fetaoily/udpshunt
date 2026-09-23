@@ -29,6 +29,12 @@ type Metrics struct {
 	reloads         prometheus.Counter
 	reloadFailures  prometheus.Counter
 	startedAtSet    bool
+
+	// OnBlacklisted, when set, is invoked with each blacklisted-packet
+	// count alongside the udpshunt_blacklisted_packets_total counter, so
+	// the app can keep a lock-free /status total. Set once at startup;
+	// called only from the packet-drop path.
+	OnBlacklisted func(int64)
 }
 
 // New creates the registry and registers every metric family.
@@ -139,6 +145,9 @@ func (lm *ListenerMetrics) SessionCreated() {
 func (lm *ListenerMetrics) Blacklisted(n int) {
 	if lm != nil {
 		lm.m.blacklisted.WithLabelValues(lm.name).Add(float64(n))
+		if lm.m.OnBlacklisted != nil {
+			lm.m.OnBlacklisted(int64(n))
+		}
 	}
 }
 

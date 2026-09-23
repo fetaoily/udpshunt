@@ -122,6 +122,20 @@ func TestNilListenerMetricsSafe(t *testing.T) {
 	lm.Blacklisted(1)
 }
 
+func TestOnBlacklistedHook(t *testing.T) {
+	m := New()
+	var total int64
+	m.OnBlacklisted = func(n int64) { total += n }
+	lm := m.ForListener("t")
+	lm.Blacklisted(1)
+	lm.Blacklisted(4)
+	if total != 5 {
+		t.Fatalf("OnBlacklisted total = %d, want 5", total)
+	}
+	// The zero value (hook unset) must not panic.
+	New().ForListener("t").Blacklisted(1)
+}
+
 func TestForListenerReusesChildren(t *testing.T) {
 	m := New()
 	m.ForListener("t").PacketsIn(1)

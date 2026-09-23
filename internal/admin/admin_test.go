@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -137,12 +139,13 @@ func TestUIRoute(t *testing.T) {
 func TestClientsEndpoint(t *testing.T) {
 	var gotSort, gotOrder string
 	var gotLimit int
+	var gotBlocked bool
 	s := New("127.0.0.1:0", Deps{
 		Registry: prometheus.NewRegistry(),
 		Status:   func() Status { return Status{} },
 		Reload:   func() error { return nil },
-		Clients: func(sortCol, order string, limit int) ClientsStatus {
-			gotSort, gotOrder, gotLimit = sortCol, order, limit
+		Clients: func(sortCol, order string, limit int, blocked bool) ClientsStatus {
+			gotSort, gotOrder, gotLimit, gotBlocked = sortCol, order, limit, blocked
 			return ClientsStatus{
 				Enabled: true,
 				Tracked: 2,
@@ -176,7 +179,7 @@ func TestClientsEndpoint(t *testing.T) {
 		t.Fatalf("params not passed: sort=%q order=%q limit=%d", gotSort, gotOrder, gotLimit)
 	}
 
-	// Defaults: requests, desc, 200.
+	// Defaults: requests, desc, 200, general scope.
 	resp2, err := http.Get(ts.URL + "/clients")
 	if err != nil {
 		t.Fatal(err)
@@ -184,6 +187,19 @@ func TestClientsEndpoint(t *testing.T) {
 	resp2.Body.Close()
 	if gotSort != "requests" || gotOrder != "desc" || gotLimit != 200 {
 		t.Fatalf("defaults wrong: sort=%q order=%q limit=%d", gotSort, gotOrder, gotLimit)
+	}
+	if gotBlocked {
+		t.Fatal("default scope must not be blocked")
+	}
+
+	// scope=blocked selects the blocked-traffic table.
+	resp5, err := http.Get(ts.URL + "/clients?scope=blocked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp5.Body.Close()
+	if !gotBlocked {
+		t.Fatal("scope=blocked must reach the Clients dep")
 	}
 
 	// Limit is clamped.
@@ -208,6 +224,141 @@ func TestClientsEndpoint(t *testing.T) {
 	body4, _ := io.ReadAll(resp4.Body)
 	if !strings.Contains(string(body4), `"enabled":false`) {
 		t.Fatalf("nil Clients must be disabled shape: %s", body4)
+	}
+}
+
+// delReq issues a DELETE against the test server and returns the response.
+func delReq(t *testing.T, rawURL string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodDelete, rawURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func TestBlacklistRoutes(t *testing.T) {
+	s := New("127.0.0.1:0", Deps{
+		Registry: prometheus.NewRegistry(),
+		Status:   func() Status { return Status{} },
+		Reload:   func() error { return nil },
+		Blacklist: func() BlacklistStatus {
+			return BlacklistStatus{
+				Entries:        []string{"203.0.113.7/32", "198.51.100.0/24"},
+				LogBlocked:     true,
+				BlockedPackets: 7,
+			}
+		},
+		BlacklistAdd: func(entry string) error {
+			if entry == "not-an-ip" {
+				return fmt.Errorf("blocklist: invalid entry %q", entry)
+			}
+			return nil
+		},
+		BlacklistDel: func(entry string) error {
+			if entry == "missing" {
+				return fmt.Errorf("blacklist: entry %q: %w", entry, os.ErrNotExist)
+			}
+			return nil
+		},
+		Clients: func(sortCol, order string, limit int, blocked bool) ClientsStatus {
+			return ClientsStatus{Enabled: true}
+		},
+		Logger: slog.Default(),
+	})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	// GET returns the JSON shape.
+	resp, err := http.Get(ts.URL + "/blacklist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /blacklist = %d", resp.StatusCode)
+	}
+	for _, want := range []string{
+		`"entries"`, `"203.0.113.7/32"`, `"198.51.100.0/24"`, `"log_blocked":true`, `"blocked_packets":7`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("blacklist body missing %q: %s", want, body)
+		}
+	}
+
+	// POST: invalid JSON -> 400.
+	resp2, err := http.Post(ts.URL+"/blacklist", "application/json", strings.NewReader("{broken"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST invalid JSON = %d, want 400", resp2.StatusCode)
+	}
+	// POST: empty entry -> 400.
+	resp3, err := http.Post(ts.URL+"/blacklist", "application/json", strings.NewReader(`{"entry":""}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST empty entry = %d, want 400", resp3.StatusCode)
+	}
+	// POST: invalid entry (validation error) -> 400 carrying the error text.
+	resp4, err := http.Post(ts.URL+"/blacklist", "application/json", strings.NewReader(`{"entry":"not-an-ip"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body4, _ := io.ReadAll(resp4.Body)
+	resp4.Body.Close()
+	if resp4.StatusCode != http.StatusBadRequest || !strings.Contains(string(body4), "not-an-ip") {
+		t.Fatalf("POST invalid entry = %d %q, want 400 with error text", resp4.StatusCode, body4)
+	}
+	// POST: valid entry -> 204.
+	resp5, err := http.Post(ts.URL+"/blacklist", "application/json", strings.NewReader(`{"entry":"198.51.100.9"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp5.Body.Close()
+	if resp5.StatusCode != http.StatusNoContent {
+		t.Fatalf("POST valid entry = %d, want 204", resp5.StatusCode)
+	}
+
+	// DELETE: missing param -> 400.
+	resp6 := delReq(t, ts.URL+"/blacklist")
+	resp6.Body.Close()
+	if resp6.StatusCode != http.StatusBadRequest {
+		t.Fatalf("DELETE without entry = %d, want 400", resp6.StatusCode)
+	}
+	// DELETE: unknown entry -> 404.
+	resp7 := delReq(t, ts.URL+"/blacklist?entry=missing")
+	resp7.Body.Close()
+	if resp7.StatusCode != http.StatusNotFound {
+		t.Fatalf("DELETE unknown entry = %d, want 404", resp7.StatusCode)
+	}
+	// DELETE: known entry -> 204.
+	resp8 := delReq(t, ts.URL+"/blacklist?entry="+url.QueryEscape("198.51.100.0/24"))
+	resp8.Body.Close()
+	if resp8.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE known entry = %d, want 204", resp8.StatusCode)
+	}
+
+	// Without the blacklist deps the GET degrades to 503, not a panic.
+	s2 := New("127.0.0.1:0", Deps{Registry: prometheus.NewRegistry(), Logger: slog.Default()})
+	ts2 := httptest.NewServer(s2.Handler())
+	defer ts2.Close()
+	resp9, err := http.Get(ts2.URL + "/blacklist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp9.Body.Close()
+	if resp9.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("nil Blacklist dep = %d, want 503", resp9.StatusCode)
 	}
 }
 

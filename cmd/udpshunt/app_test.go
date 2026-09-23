@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -747,6 +749,225 @@ func TestStatusAttributionFields(t *testing.T) {
 	if !sawConfirm {
 		t.Fatal("backend_down event must carry confirmed_by=probe")
 	}
+}
+
+// waitFor polls cond until it holds or a 2s deadline passes.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not reached in time")
+}
+
+// testClientUDP returns a persistent loopback UDP socket, so one client
+// (one IP:port session) can be followed across block/unblock transitions.
+func testClientUDP(t *testing.T) *net.UDPConn {
+	t.Helper()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	return pc
+}
+
+// cliTrip sends payload via the persistent client and returns the echo
+// reply; a blocked client sees the read-deadtime error instead.
+func cliTrip(t *testing.T, cli *net.UDPConn, dst *net.UDPAddr, payload string) (string, error) {
+	t.Helper()
+	if _, err := cli.WriteToUDP([]byte(payload), dst); err != nil {
+		return "", err
+	}
+	buf := make([]byte, 65536)
+	cli.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err := cli.ReadFromUDP(buf)
+	if err != nil {
+		return "", err
+	}
+	return string(buf[:n]), nil
+}
+
+func TestBlacklistRuntimeAPIAndReload(t *testing.T) {
+	b1 := startEcho(t)
+	pA := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1),
+		"blacklist:\n  entries: [203.0.113.7]\n"))
+	app, _ := newApp(t, pA)
+	if err := app.Apply(context.Background(), mustLoad(t, pA)); err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	l1 := app.listeners["L1"].Addr()
+	app.mu.Unlock()
+
+	cli := testClientUDP(t)
+	cliIP := cli.LocalAddr().(*net.UDPAddr).IP.String()
+	if got, err := cliTrip(t, cli, l1, "hi"); err != nil || got != "echo:hi" {
+		t.Fatalf("setup round trip: %q %v", got, err)
+	}
+	waitFor(t, func() bool { return app.mgr.Count() == 1 })
+
+	// Runtime add: closes the client's live session, records the event and
+	// lists the entry (canonical host-length form).
+	if err := app.BlacklistAdd(cliIP); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return app.mgr.Count() == 0 })
+	sawAdded := false
+	for _, e := range app.events.List() {
+		if e.Kind == "blacklist_added" && strings.Contains(e.Detail, "closed=1") {
+			sawAdded = true
+		}
+	}
+	if !sawAdded {
+		t.Fatalf("blacklist_added closed=1 event missing: %+v", app.events.List())
+	}
+	if !slices.Contains(app.Blacklist().Entries, cliIP+"/32") {
+		t.Fatalf("Blacklist() must list %s/32, got %v", cliIP, app.Blacklist().Entries)
+	}
+	// Blocked traffic gets no reply and creates no session.
+	if got, err := cliTrip(t, cli, l1, "evil"); err == nil {
+		t.Fatalf("blocked client must get no reply, got %q", got)
+	}
+	if n := app.mgr.Count(); n != 0 {
+		t.Fatalf("blocked packet must not create a session, count = %d", n)
+	}
+
+	// Runtime del unblocks: a fresh round trip works again.
+	if err := app.BlacklistDel(cliIP); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := cliTrip(t, cli, l1, "back"); err != nil || got != "echo:back" {
+		t.Fatalf("unblocked round trip: %q %v", got, err)
+	}
+	waitFor(t, func() bool { return app.mgr.Count() == 1 })
+
+	// Reload that adds a CIDR over the client's live session: the reload
+	// enforcement sweep closes the session and fires blacklist_enforced.
+	pB := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1),
+		"blacklist:\n  entries: [203.0.113.7, 127.0.0.0/8]\n"))
+	if err := app.Apply(context.Background(), mustLoad(t, pB)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return app.mgr.Count() == 0 })
+	sawEnforced := false
+	for _, e := range app.events.List() {
+		if e.Kind == "blacklist_enforced" && strings.Contains(e.Detail, "closed=1") {
+			sawEnforced = true
+		}
+	}
+	if !sawEnforced {
+		t.Fatalf("blacklist_enforced closed=1 event missing: %+v", app.events.List())
+	}
+
+	// A runtime add survives a reload that does not mention it (union
+	// model), while config B's CIDR leaves with config B.
+	if err := app.BlacklistAdd("192.0.2.1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Apply(context.Background(), mustLoad(t, pA)); err != nil {
+		t.Fatal(err)
+	}
+	entries := app.Blacklist().Entries
+	if !slices.Contains(entries, "192.0.2.1/32") {
+		t.Fatalf("runtime add must survive reload, got %v", entries)
+	}
+	if slices.Contains(entries, "127.0.0.0/8") {
+		t.Fatalf("config B's CIDR must be gone after config A reapplies, got %v", entries)
+	}
+
+	// Deleting an entry that is not effective is a not-found error.
+	if err := app.BlacklistDel("198.51.100.9"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("del of unknown entry = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestStatusBlacklistBlockedPackets(t *testing.T) {
+	b1 := startEcho(t)
+	p := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1),
+		"blacklist:\n  entries: [203.0.113.7]\n"))
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	l1 := app.listeners["L1"].Addr()
+	app.mu.Unlock()
+	// Blacklist the test client's own IP, then send one packet: /status
+	// must report it under blacklist.blocked_packets.
+	if err := app.BlacklistAdd("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	sendUDP(t, l1, "dropped")
+	waitFor(t, func() bool {
+		st := app.Status()
+		return st.Blacklist != nil && st.Blacklist.BlockedPackets >= 1
+	})
+}
+
+func TestBlacklistWatch(t *testing.T) {
+	b1 := startEcho(t)
+	blFile := filepath.Join(t.TempDir(), "bl.txt")
+	if err := os.WriteFile(blFile, []byte("203.0.113.7"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Forward slashes keep the YAML scalar and the Windows path valid.
+	yamlPath := strings.ReplaceAll(blFile, "\\", "/")
+	p := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1),
+		fmt.Sprintf("blacklist:\n  file: %s\n  watch_interval: 100ms\n", yamlPath)))
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	wctx, wcancel := context.WithCancel(context.Background())
+	t.Cleanup(wcancel)
+	go app.WatchBlacklist(wctx)
+
+	contains := func(entry string) bool {
+		return slices.Contains(app.Blacklist().Entries, entry)
+	}
+	if !contains("203.0.113.7/32") {
+		t.Fatalf("initial file entries missing: %v", app.Blacklist().Entries)
+	}
+
+	// Rewriting the file swaps the list within a couple of ticks and
+	// records the reload event.
+	if err := os.WriteFile(blFile, []byte("198.51.100.5"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return contains("198.51.100.5/32") && !contains("203.0.113.7/32") })
+	sawReload := false
+	for _, e := range app.events.List() {
+		if e.Kind == "blacklist_reloaded" && strings.Contains(e.Detail, "source=file") {
+			sawReload = true
+		}
+	}
+	if !sawReload {
+		t.Fatal("blacklist_reloaded event missing")
+	}
+
+	// A broken file keeps the previous list (best-effort watch).
+	if err := os.WriteFile(blFile, []byte("not-an-ip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if !contains("198.51.100.5/32") || len(app.Blacklist().Entries) != 1 {
+		t.Fatalf("broken file must not change the list, got %v", app.Blacklist().Entries)
+	}
+
+	// Fixing the file recovers on a later tick.
+	if err := os.WriteFile(blFile, []byte("192.0.2.9"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return contains("192.0.2.9/32") })
 }
 
 // A stopped listener's balancer must have its state-change callback detached:

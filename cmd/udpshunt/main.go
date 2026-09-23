@@ -101,20 +101,39 @@ func run() error {
 		})
 		defer app.clientStats.Stop()
 	}
+	// Blocked-traffic accounting (spec §9): blacklisted packets land in a
+	// second, independent client-stats table so they never pollute the
+	// legitimate-traffic view. Its snapshot files carry a dedicated prefix;
+	// directory and retention follow client_stats. Created only when client
+	// stats are on AND a blacklist section is configured; otherwise nil and
+	// the blocked path only counts metrics.
+	if cfg.ClientStats.IsEnabled() && (cfg.Blacklist.File != "" || len(cfg.Blacklist.Entries) > 0) {
+		app.blockedStats = clientstats.New(clientstats.Options{
+			Dir:           cfg.ClientStats.Dir,
+			RetentionDays: cfg.ClientStats.RetentionDays,
+			FilePrefix:    "udpshunt-blocked-",
+			Logger:        logger,
+		})
+		defer app.blockedStats.Stop()
+	}
 	app.met.SetStartedAt(time.Now())
 	app.met.SetSessionStats(app.mgr.Created, app.mgr.Expired, app.mgr.Rejected,
 		func() int64 { return int64(app.mgr.Count()) })
 	app.mgr.SetMax(int64(cfg.Sessions.Max))
 	app.mgr.Start(ctx, time.Second) // spec §3: sweep 1/8 of shards per second
 	go app.runSampler(ctx)          // spec §8: rate history, one sample per second
+	go app.WatchBlacklist(ctx)      // spec §3: blacklist file mtime polling
 
 	adminSrv := admin.New(cfg.Admin.Bind, admin.Deps{
-		Registry: app.met.Registry(),
-		Status:   app.Status,
-		Reload:   app.Reload,
-		Clients:  app.Clients,
-		Logger:   logger,
-		UI:       webui.Handler(),
+		Registry:     app.met.Registry(),
+		Status:       app.Status,
+		Reload:       app.Reload,
+		Clients:      app.Clients,
+		Blacklist:    app.Blacklist,
+		BlacklistAdd: app.BlacklistAdd,
+		BlacklistDel: app.BlacklistDel,
+		Logger:       logger,
+		UI:           webui.Handler(),
 	})
 	go func() {
 		if err := adminSrv.Run(ctx); err != nil {

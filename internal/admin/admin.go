@@ -5,9 +5,11 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -62,7 +64,16 @@ type Status struct {
 	Listeners  []ListenerStatus  `json:"listeners"`
 	Sessions   SessionsStatus    `json:"sessions"`
 	RequestLog *RequestLogStatus `json:"request_log,omitempty"`
+	Blacklist  *BlacklistStatus  `json:"blacklist,omitempty"`
 	Events     []Event           `json:"events"`
+}
+
+// BlacklistStatus is the JSON shape of GET /blacklist and of the /status
+// blacklist field.
+type BlacklistStatus struct {
+	Entries        []string `json:"entries"`
+	LogBlocked     bool     `json:"log_blocked"`
+	BlockedPackets int64    `json:"blocked_packets"`
 }
 
 // RequestLogStatus is the /status view of the per-request file log.
@@ -118,12 +129,15 @@ type SessionsStatus struct {
 
 // Deps are the injected behaviors of the server.
 type Deps struct {
-	Registry *prometheus.Registry
-	Status   func() Status
-	Reload   func() error
-	Clients  func(sortCol, order string, limit int) ClientsStatus
-	Logger   *slog.Logger
-	UI       http.Handler
+	Registry     *prometheus.Registry
+	Status       func() Status
+	Reload       func() error
+	Clients      func(sortCol, order string, limit int, blocked bool) ClientsStatus
+	Blacklist    func() BlacklistStatus
+	BlacklistAdd func(entry string) error
+	BlacklistDel func(entry string) error
+	Logger       *slog.Logger
+	UI           http.Handler
 }
 
 // Server is the admin HTTP endpoint.
@@ -139,6 +153,9 @@ func New(bind string, deps Deps) *Server {
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /clients", s.handleClients)
 	mux.HandleFunc("POST /reload", s.handleReload)
+	mux.HandleFunc("GET /blacklist", s.handleBlacklistGet)
+	mux.HandleFunc("POST /blacklist", s.handleBlacklistAdd)
+	mux.HandleFunc("DELETE /blacklist", s.handleBlacklistDel)
 	if deps.UI != nil {
 		ui := http.StripPrefix("/ui", deps.UI)
 		mux.Handle("GET /ui", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -161,7 +178,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 }
 
 // handleClients serves the per-client-IP table: ?sort=<column>&order=
-// asc|desc&limit=<n>. Defaults match the UIs: requests, descending, 200.
+// asc|desc&limit=<n>&scope=normal|blocked. Defaults match the UIs: requests,
+// descending, 200, general scope.
 func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	sortCol := q.Get("sort")
@@ -182,11 +200,72 @@ func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	var st ClientsStatus
 	if s.deps.Clients != nil {
-		st = s.deps.Clients(sortCol, order, limit)
+		st = s.deps.Clients(sortCol, order, limit, q.Get("scope") == "blocked")
 	}
 	if err := json.NewEncoder(w).Encode(st); err != nil {
 		s.deps.Logger.Warn("clients encode failed", "err", err)
 	}
+}
+
+// handleBlacklistGet serves the current blacklist state; 503 when the app
+// did not wire the feature.
+func (s *Server) handleBlacklistGet(w http.ResponseWriter, _ *http.Request) {
+	if s.deps.Blacklist == nil {
+		http.Error(w, "blacklist not available", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(s.deps.Blacklist()); err != nil {
+		s.deps.Logger.Warn("blacklist encode failed", "err", err)
+	}
+}
+
+// handleBlacklistAdd blocks one entry: invalid JSON or an empty entry is a
+// 400, a validation error a 400 carrying the error text, success a 204.
+func (s *Server) handleBlacklistAdd(w http.ResponseWriter, r *http.Request) {
+	if s.deps.BlacklistAdd == nil {
+		http.Error(w, "blacklist not available", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Entry string `json:"entry"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if req.Entry == "" {
+		http.Error(w, "entry is required", http.StatusBadRequest)
+		return
+	}
+	if err := s.deps.BlacklistAdd(req.Entry); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleBlacklistDel unblocks the entry given as the ?entry= query
+// parameter; an unknown entry (os.ErrNotExist from the app) is a 404.
+func (s *Server) handleBlacklistDel(w http.ResponseWriter, r *http.Request) {
+	if s.deps.BlacklistDel == nil {
+		http.Error(w, "blacklist not available", http.StatusServiceUnavailable)
+		return
+	}
+	entry := r.URL.Query().Get("entry")
+	if entry == "" {
+		http.Error(w, "entry query parameter is required", http.StatusBadRequest)
+		return
+	}
+	if err := s.deps.BlacklistDel(entry); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleReload(w http.ResponseWriter, _ *http.Request) {
