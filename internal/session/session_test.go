@@ -131,6 +131,27 @@ func TestCloseBackendFiltersListenerAndBackend(t *testing.T) {
 	}
 }
 
+func TestCloseClientsByPredicate(t *testing.T) {
+	mgr := NewManager(0)
+	a := testAddr(t, "203.0.113.7:1111")
+	b := testAddr(t, "203.0.113.8:2222")
+	mgr.Put("L", a, NewSession("L", a, "b:1", testUpstream(t), time.Minute))
+	mgr.Put("L", b, NewSession("L", b, "b:1", testUpstream(t), time.Minute))
+	n := mgr.CloseClients(func(c *net.UDPAddr) bool { return c.IP.Equal(net.IPv4(203, 0, 113, 7)) })
+	if n != 1 {
+		t.Fatalf("closed = %d, want 1", n)
+	}
+	if mgr.Count() != 1 {
+		t.Fatalf("Count = %d, want 1 remaining", mgr.Count())
+	}
+	if mgr.Get("L", a) != nil {
+		t.Fatal("blocked client's session should be gone")
+	}
+	if mgr.Get("L", b) == nil {
+		t.Fatal("other client's session must survive")
+	}
+}
+
 func TestIdleAging(t *testing.T) {
 	mgr := NewManager(0)
 	ctx, cancel := context.WithCancel(context.Background())

@@ -257,3 +257,9 @@ func (m *Manager) BackendCounts(listener string) map[string]int64 {
 func (m *Manager) CloseListener(listener string) int {
 	return m.closeWhere(func(s *Session) bool { return s.Listener == listener })
 }
+
+// CloseClients closes every session whose client address satisfies pred and
+// returns how many were closed.
+func (m *Manager) CloseClients(pred func(client *net.UDPAddr) bool) int {
+	return m.closeWhere(func(s *Session) bool { return pred(s.Client) })
+}
