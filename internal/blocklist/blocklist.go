@@ -105,14 +105,44 @@ func (l *List) Blocked(a netip.Addr) bool {
 // host-length prefixes), sorted for stable output.
 func (l *List) Entries() []string {
 	out := make([]string, 0, len(l.exact)+len(l.prefixes))
+	prefixes := make([]netip.Prefix, 0, len(l.exact)+len(l.prefixes))
 	for a := range l.exact {
-		out = append(out, netip.PrefixFrom(a, a.BitLen()).String())
+		prefixes = append(prefixes, netip.PrefixFrom(a, a.BitLen()))
 	}
-	for _, p := range l.prefixes {
+	prefixes = append(prefixes, l.prefixes...)
+	// Numeric IP order (10.0.0.2 < 10.0.0.9 < 10.0.0.10), matching the
+	// list file's on-disk layout — not lexicographic order. The comparator
+	// is hand-rolled (16-byte address order, then prefix length) to stay
+	// independent of netip.Prefix.Compare's toolchain availability.
+	slices.SortFunc(prefixes, comparePrefix)
+	for _, p := range prefixes {
 		out = append(out, p.String())
 	}
-	slices.Sort(out)
 	return out
+}
+
+// comparePrefix orders prefixes by address bytes (16-byte form, which
+// totals all addresses; IPv4 sorts in its mapped position) and then by
+// prefix length.
+func comparePrefix(a, b netip.Prefix) int {
+	ab, bb := a.Addr().As16(), b.Addr().As16()
+	if c := slices.Compare(ab[:], bb[:]); c != 0 {
+		return c
+	}
+	return a.Bits() - b.Bits()
+}
+
+// SortCanonical sorts canonical entry strings into the same numeric IP
+// order as Entries — the list-file writer uses it for its on-disk layout.
+func SortCanonical(entries []string) {
+	slices.SortFunc(entries, func(a, b string) int {
+		pa, errA := netip.ParsePrefix(a)
+		pb, errB := netip.ParsePrefix(b)
+		if errA != nil || errB != nil {
+			return strings.Compare(a, b) // canonical entries parse; defensive
+		}
+		return comparePrefix(pa, pb)
+	})
 }
 
 // Len returns the number of distinct entries: exact addresses plus prefixes.

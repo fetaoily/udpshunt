@@ -1229,7 +1229,8 @@ func TestBlacklistDelRemovesFromFile(t *testing.T) {
 // source of truth, so an unpersistable add is refused entirely.
 func TestBlacklistAddPersistFailureKeepsState(t *testing.T) {
 	backend := startEcho(t)
-	blFile := filepath.Join(t.TempDir(), "bl.txt")
+	dir := t.TempDir()
+	blFile := filepath.Join(dir, "bl.txt")
 	if err := os.WriteFile(blFile, []byte("203.0.113.7"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1238,10 +1239,16 @@ func TestBlacklistAddPersistFailureKeepsState(t *testing.T) {
 	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(blFile, 0o444); err != nil { // read-only: appends fail
+	// Replace the list file with a directory: reading it fails on every OS
+	// (Windows ignores the read-only attribute on directories, so chmod
+	// tricks are not portable here).
+	if err := os.Remove(blFile); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(blFile, 0o644) })
+	if err := os.Mkdir(blFile, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(blFile) })
 	err := app.BlacklistAdd("198.51.100.9")
 	if err == nil {
 		t.Fatal("add must fail when the list file cannot be written")
@@ -1284,5 +1291,45 @@ func TestBlacklistAddIdempotent(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("file carries %d copies of the entry, want 1: %v", count, entries)
+	}
+}
+
+// API writes keep the list file sorted by IP (numeric order, so
+// 10.0.0.2 < 10.0.0.9 < 10.0.0.10, not lexicographic).
+func TestBlacklistFileSortedOnWrite(t *testing.T) {
+	backend := startEcho(t)
+	blFile := filepath.Join(t.TempDir(), "bl.txt")
+	if err := os.WriteFile(blFile, []byte("10.0.0.9,192.0.2.1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := blacklistFileCfg(t, backend, blFile)
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.BlacklistAdd("10.0.0.10"); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.BlacklistAdd("10.0.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"10.0.0.2/32", "10.0.0.9/32", "10.0.0.10/32", "192.0.2.1/32"}
+	got, err := blocklist.ReadFileEntries(blFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("file order = %v, want %v", got, want)
+	}
+	// Delete keeps the order.
+	if err := app.BlacklistDel("10.0.0.9"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = blocklist.ReadFileEntries(blFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{"10.0.0.2/32", "10.0.0.10/32", "192.0.2.1/32"}) {
+		t.Fatalf("file order after delete = %v", got)
 	}
 }

@@ -282,49 +282,62 @@ func canonicalizeEntries(entries []string) ([]string, error) {
 	return out, nil
 }
 
-// appendListEntry appends one canonical entry as a new line to the list
-// file, creating the file if absent. It is the persistence half of
-// BlacklistAdd: the file is written BEFORE any in-memory change, so an
-// unpersistable add is refused entirely. The append is IDEMPOTENT — an
-// entry the file already carries is not written again, so repeated API
-// adds cannot pile up duplicate lines. Hand-edited files often lack the
-// trailing newline; without the separator check the appended entry would
-// glue onto the last line and change its meaning. List files are sized
-// for hundreds of entries, so the two reads are not a concern.
-func appendListEntry(path, canonical string) error {
-	if entries, err := blocklist.ReadFileEntries(path); err == nil {
-		if can, err := canonicalizeEntries(entries); err == nil && slices.Contains(can, canonical) {
-			return nil
-		}
-		// A parse error here resurfaces (fail-closed) at the rebuild after
-		// the append; treat the entry as absent and let that report it.
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	sep := ""
-	if b, err := os.ReadFile(path); err == nil {
-		if len(b) > 0 && b[len(b)-1] != '\n' && b[len(b)-1] != ',' {
-			sep = "\n"
-		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+// writeListFile rewrites the list file with the canonical entries, sorted
+// by IP (blocklist.SortCanonical) and one per line, atomically (temp file
+// + rename in the same directory). Every API mutation funnels through
+// here, so the file settles into the same deterministic layout regardless
+// of insertion or hand-edit order.
+func writeListFile(path string, can []string) error {
+	sorted := slices.Clone(can)
+	blocklist.SortCanonical(sorted)
+	tmp, err := os.CreateTemp(filepath.Dir(path), "blacklist-*.tmp")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	if _, err := fmt.Fprintf(f, "%s%s\n", sep, canonical); err != nil {
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+	var b strings.Builder
+	for _, e := range sorted {
+		b.WriteString(e)
+		b.WriteByte('\n')
+	}
+	if _, err := tmp.WriteString(b.String()); err != nil {
+		tmp.Close()
 		return err
 	}
-	return f.Sync()
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
-// rewriteListFileWithout rewrites the list file without the canonical
-// entry (atomic temp file + rename in the same directory). removed
-// reports whether the file carried the entry at all; a missing file
-// simply removes nothing.
-func rewriteListFileWithout(path, canonical string) (removed bool, err error) {
+// listFileAdd persists canonical to the list file (idempotent): the file
+// is rewritten BEFORE any in-memory change, so an unpersistable add is
+// refused entirely, and an entry the file already carries is a no-op. A
+// file with an unparsable line is refused rather than rewritten — the
+// rewrite must never silently drop content it cannot parse.
+func listFileAdd(path, canonical string) error {
+	entries, err := blocklist.ReadFileEntries(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	can, err := canonicalizeEntries(entries)
+	if err != nil {
+		return err
+	}
+	if slices.Contains(can, canonical) {
+		return nil
+	}
+	return writeListFile(path, append(can, canonical))
+}
+
+// listFileRemove rewrites the list file without canonical (sorted, via
+// writeListFile). removed reports whether the file carried the entry at
+// all; a missing file simply removes nothing.
+func listFileRemove(path, canonical string) (bool, error) {
 	entries, err := blocklist.ReadFileEntries(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -339,29 +352,13 @@ func rewriteListFileWithout(path, canonical string) (removed bool, err error) {
 	if !slices.Contains(can, canonical) {
 		return false, nil
 	}
-	lines := make([]string, 0, len(can)-1)
+	out := make([]string, 0, len(can)-1)
 	for _, e := range can {
 		if e != canonical {
-			lines = append(lines, e)
+			out = append(out, e)
 		}
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "blacklist-*.tmp")
-	if err != nil {
-		return false, err
-	}
-	defer os.Remove(tmp.Name()) // no-op after a successful rename
-	if _, err := tmp.WriteString(strings.Join(lines, "\n") + "\n"); err != nil {
-		tmp.Close()
-		return false, err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return false, err
-	}
-	if err := tmp.Close(); err != nil {
-		return false, err
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
+	if err := writeListFile(path, out); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -424,7 +421,7 @@ func (a *App) BlacklistAdd(entry string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if file := a.cfg.Blacklist.File; file != "" {
-		if err := appendListEntry(file, canonical); err != nil {
+		if err := listFileAdd(file, canonical); err != nil {
 			return fmt.Errorf("blacklist: persist entry to list file: %w", err)
 		}
 		// Keep the config-source cache in step with the file just written
@@ -472,7 +469,7 @@ func (a *App) BlacklistDel(entry string) error {
 		return fmt.Errorf("blacklist: entry %q: %w", entry, os.ErrNotExist)
 	}
 	if file := a.cfg.Blacklist.File; file != "" {
-		removed, err := rewriteListFileWithout(file, canonical)
+		removed, err := listFileRemove(file, canonical)
 		if err != nil {
 			return fmt.Errorf("blacklist: persist removal to list file: %w", err)
 		}
