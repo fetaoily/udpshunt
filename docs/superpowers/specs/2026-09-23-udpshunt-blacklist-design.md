@@ -36,13 +36,24 @@ blacklist:
     - 203.0.113.7     # 精确 IP（内部规范化为 /32 或 /128）
     - 198.51.100.0/24 # CIDR
   file: ""            # 可选：独立拉黑文件路径，逗号（及换行）分隔的条目
+  watch_interval: 5s  # file 的 mtime 轮询间隔；0 = 关闭监视（纯 reload 模式）
   log_blocked: false  # 默认 false：被拦包是否写 request_log（见 §8）
 ```
 
 少量条目直接写 `entries`；量大或需要独立维护时用 `file` 指向独立文件（如
 `/etc/udpshunt/blacklist.txt`，内容形如 `203.0.113.7,198.51.100.0/24`，逗号与
 换行均作分隔）。两个来源取**并集**，都属于"配置来源"（§7 的 union 模型中随
-reload 重建）。文件随启动与每次 `/reload` 重读，不做 inotify 实时监视。
+reload 重建）。
+
+**文件监视（mtime 轮询）**：`watch_interval > 0` 且 `file` 已配置时，后台
+goroutine 每 tick 对文件 `os.Stat` 一次，mtime/size 变化则重读解析、成功后
+原子换表并记 `blacklist_reloaded entries=N source=file` 事件。选轮询而非
+inotify/fsnotify：无新依赖、对编辑器的临时文件+rename 写法天然免疫（Stat
+跟随新 inode）、跨平台行为一致；成本为每 tick 一次元数据 syscall（dentry
+缓存命中，无磁盘 I/O），对数据路径零影响（COW）。**best-effort 语义**：
+监视路径读到写了一半的文件、解析失败时保留旧名单并记 error 日志，下一 tick
+自动重试 —— 与启动/`/reload` 路径的 fail-closed 有意不同（显式动作该硬，
+后台监视该韧）。`watch_interval` 校验：>= 0，负数报错。
 
 校验：每个条目用 `net/netip` 的 `ParsePrefix`（裸 IP 补 `/<w>`）或 `ParseAddr` 解析，
 非法即配置错误；`Is4In6` 统一 `Unmap()` 规范化；重复条目静默去重；IPv4/IPv6 均可，
@@ -169,7 +180,10 @@ App 持有：`blocklist *blocklist.Container`（全局一份，各 listener 共�
   维持删除）；/status 字段。
 - **config**：条目校验表驱动（合法/非法/IP 带前缀长度/重复）；独立文件的
   加载（逗号/换行分隔、与 entries 并集、文件缺失报错、文件内非法条目报错并带
-  文件名）。
+  文件名）；`watch_interval` 负数拒绝。
+- **文件监视**：改写文件后一个 tick 内换表生效（事件可断言）；写一半的
+  内容（非法条目）保留旧名单 + error 日志、修复后自动恢复；`watch_interval: 0`
+  不启动监视。
 - **clientstats**：`FilePrefix` 选项——两个实例写各自的 snapshot 文件互不覆盖；
   被拦表/合法表数据隔离（对同一 IP 分别记账互不串扰）。
 
