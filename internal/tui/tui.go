@@ -47,10 +47,12 @@ type model struct {
 	errText string
 
 	// Clients view state: view is "dash" or "clients"; sortIdx indexes
-	// clientCols; sortAsc flips the /clients order parameter.
-	view    string
-	sortIdx int
-	sortAsc bool
+	// clientCols; sortAsc flips the /clients order parameter; clientsBlocked
+	// switches the /clients fetch to the blocked-traffic table.
+	view           string
+	sortIdx        int
+	sortAsc        bool
+	clientsBlocked bool
 }
 
 func (m model) Init() tea.Cmd {
@@ -84,12 +86,16 @@ func fetchStatus(addr string) (admin.Status, error) {
 	return st, err
 }
 
-// fetchClients reads the top-100 client rows for the current sort column.
-func fetchClients(addr, sortCol string, asc bool) (admin.ClientsStatus, error) {
+// fetchClients reads the top-100 client rows for the current sort column;
+// blocked selects the blocked-traffic table instead of tracked clients.
+func fetchClients(addr, sortCol string, asc, blocked bool) (admin.ClientsStatus, error) {
 	var cs admin.ClientsStatus
 	u := strings.TrimRight(addr, "/") + "/clients?sort=" + url.QueryEscape(sortCol) + "&limit=100"
 	if asc {
 		u += "&order=asc"
+	}
+	if blocked {
+		u += "&scope=blocked"
 	}
 	resp, err := httpClient.Get(u)
 	if err != nil {
@@ -106,7 +112,7 @@ func fetchClients(addr, sortCol string, asc bool) (admin.ClientsStatus, error) {
 func fetchClientsCmd(m model) tea.Cmd {
 	sortCol := clientCols[m.sortIdx].sort
 	return func() tea.Msg {
-		cs, err := fetchClients(m.addr, sortCol, m.sortAsc)
+		cs, err := fetchClients(m.addr, sortCol, m.sortAsc, m.clientsBlocked)
 		return clientsMsg{cs: cs, err: err}
 	}
 }
@@ -132,6 +138,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			if m.view == "clients" {
 				m.sortAsc = !m.sortAsc
+				return m, fetchClientsCmd(m)
+			}
+		case "b":
+			if m.view == "clients" {
+				m.clientsBlocked = !m.clientsBlocked
 				return m, fetchClientsCmd(m)
 			}
 		}
@@ -184,9 +195,13 @@ func (m model) View() string {
 	tv := totalsFromStatus(st, m.interval)
 
 	healthy, total := uniqueBackendHealth(st)
-	fmt.Fprintf(&b, "uptime %s   sessions %d   backends %d/%d up   in %s/s (%.0f pps)   out %s/s (%.0f pps)\n\n",
+	blocked := ""
+	if st.Blacklist != nil && st.Blacklist.BlockedPackets > 0 {
+		blocked = fmt.Sprintf("   blocked %d", st.Blacklist.BlockedPackets)
+	}
+	fmt.Fprintf(&b, "uptime %s   sessions %d   backends %d/%d up   in %s/s (%.0f pps)   out %s/s (%.0f pps)%s\n\n",
 		st.Uptime, st.Sessions.Active, healthy, total,
-		humanBytes(tv.InBPS), tv.InPPS, humanBytes(tv.OutBPS), tv.OutPPS)
+		humanBytes(tv.InBPS), tv.InPPS, humanBytes(tv.OutBPS), tv.OutPPS, blocked)
 
 	for _, row := range listenerRows(historyMap(st), st.Listeners, 40) {
 		fmt.Fprintf(&b, "%s  %s  %s  sessions %d  backends %d/%d\n",
@@ -236,7 +251,11 @@ func (m model) viewClients() string {
 	if m.sortAsc {
 		dir = "asc"
 	}
-	fmt.Fprintf(&b, "tracked %d   evicted %d   sort %s %s\n\n", cs.Tracked, cs.Evicted, col.sort, dir)
+	scope := ""
+	if m.clientsBlocked {
+		scope = "   blocked"
+	}
+	fmt.Fprintf(&b, "tracked %d   evicted %d   sort %s %s%s\n\n", cs.Tracked, cs.Evicted, col.sort, dir, scope)
 	b.WriteString(clientHeader(m.sortIdx, m.sortAsc) + "\n")
 	const maxRows = 20
 	rows := cs.Rows
@@ -250,7 +269,7 @@ func (m model) viewClients() string {
 	if len(cs.Rows) > maxRows {
 		fmt.Fprintf(&b, dimStyle.Render("  ... %d more rows below\n"), len(cs.Rows)-maxRows)
 	}
-	b.WriteString(dimStyle.Render("\nc: dashboard  s: sort column  r: reverse  q: quit"))
+	b.WriteString(dimStyle.Render("\nc: dashboard  s: sort column  r: reverse  b: blocked  q: quit"))
 	return b.String()
 }
 

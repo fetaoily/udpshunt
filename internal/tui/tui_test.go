@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -102,7 +103,7 @@ func TestFetchStatusError(t *testing.T) {
 }
 
 func TestFetchClients(t *testing.T) {
-	var gotSort, gotOrder, gotLimit string
+	var gotSort, gotOrder, gotLimit, gotScope string
 	want := admin.ClientsStatus{
 		Enabled: true,
 		Tracked: 1,
@@ -112,28 +113,36 @@ func TestFetchClients(t *testing.T) {
 	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		gotSort, gotOrder, gotLimit = q.Get("sort"), q.Get("order"), q.Get("limit")
+		gotSort, gotOrder, gotLimit, gotScope = q.Get("sort"), q.Get("order"), q.Get("limit"), q.Get("scope")
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(want)
 	}))
 	defer ts.Close()
 
-	got, err := fetchClients(ts.URL, "requests", false)
+	got, err := fetchClients(ts.URL, "requests", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotSort != "requests" || gotOrder != "" || gotLimit != "100" {
-		t.Fatalf("query = sort=%q order=%q limit=%q", gotSort, gotOrder, gotLimit)
+	if gotSort != "requests" || gotOrder != "" || gotLimit != "100" || gotScope != "" {
+		t.Fatalf("query = sort=%q order=%q limit=%q scope=%q", gotSort, gotOrder, gotLimit, gotScope)
 	}
 	if len(got.Rows) != 1 || got.Rows[0].IP != "203.0.113.7" {
 		t.Fatalf("decoded = %+v", got)
 	}
 
-	if _, err := fetchClients(ts.URL, "bytes_in", true); err != nil {
+	if _, err := fetchClients(ts.URL, "bytes_in", true, false); err != nil {
 		t.Fatal(err)
 	}
 	if gotSort != "bytes_in" || gotOrder != "asc" {
 		t.Fatalf("asc query = sort=%q order=%q", gotSort, gotOrder)
+	}
+
+	// blocked=true selects the blocked-traffic table via scope=blocked.
+	if _, err := fetchClients(ts.URL, "ip", false, true); err != nil {
+		t.Fatal(err)
+	}
+	if gotScope != "blocked" {
+		t.Fatalf("blocked scope = %q, want blocked", gotScope)
 	}
 }
 
@@ -212,6 +221,88 @@ func TestClientsKeyHandling(t *testing.T) {
 	// q quits.
 	if _, cmd := m5.Update(key("q")); cmd == nil {
 		t.Fatal("q must quit")
+	}
+}
+
+func TestClientsViewBlockedMarker(t *testing.T) {
+	sample := func(blocked bool) model {
+		return model{
+			view:           "clients",
+			clientsBlocked: blocked,
+			clients: &admin.ClientsStatus{
+				Enabled: true,
+				Tracked: 2,
+				Evicted: 1,
+				Rows: []clientstats.Row{
+					{IP: "203.0.113.7", Requests: 12},
+				},
+			},
+		}
+	}
+	// The footer hint mentions b: blocked in both scopes, so inspect the
+	// tracked/evicted header line itself.
+	headerLine := func(v string) string {
+		for _, line := range strings.Split(v, "\n") {
+			if strings.HasPrefix(line, "tracked ") {
+				return line
+			}
+		}
+		return ""
+	}
+	if h := headerLine(sample(true).View()); !contains(h, "blocked") {
+		t.Fatalf("blocked scope must mark the header line: %q", h)
+	}
+	if h := headerLine(sample(false).View()); contains(h, "blocked") {
+		t.Fatalf("normal scope must not mark the header line: %q", h)
+	}
+}
+
+func TestClientsKeyBlockedToggle(t *testing.T) {
+	key := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")}
+
+	// b outside the clients view does nothing.
+	dash := model{addr: "http://x", interval: time.Second}
+	next, cmd := dash.Update(key)
+	if next.(model).clientsBlocked || cmd != nil {
+		t.Fatal("b must be clients-view only")
+	}
+
+	// b in the clients view enters the blocked scope and refetches.
+	c := dash
+	c.view = "clients"
+	next, cmd = c.Update(key)
+	m2 := next.(model)
+	if !m2.clientsBlocked {
+		t.Fatal("b must enter blocked scope")
+	}
+	if _, ok := cmd().(clientsMsg); !ok {
+		t.Fatal("b must refetch clients")
+	}
+
+	// b again returns to the normal table.
+	next, _ = m2.Update(key)
+	if next.(model).clientsBlocked {
+		t.Fatal("b again must leave blocked scope")
+	}
+}
+
+func TestDashboardBlockedCount(t *testing.T) {
+	m := model{status: &admin.Status{
+		Uptime:    "1s",
+		Blacklist: &admin.BlacklistStatus{BlockedPackets: 5},
+	}}
+	if v := m.View(); !contains(v, "blocked 5") {
+		t.Fatalf("dashboard must show the blocked count:\n%s", v)
+	}
+
+	// No blacklist block (or a zero count) means no blocked figure.
+	for _, st := range []*admin.Status{
+		{Uptime: "1s"},
+		{Uptime: "1s", Blacklist: &admin.BlacklistStatus{}},
+	} {
+		if v := (model{status: st}).View(); contains(v, "blocked") {
+			t.Fatalf("status without dropped packets must not show blocked:\n%s", v)
+		}
 	}
 }
 
