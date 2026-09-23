@@ -54,6 +54,8 @@ logging:
 #   entries: # inline list, unioned with the file below
 #     - 203.0.113.7
 #     - 198.51.100.0/24
-#   file: /etc/udpshunt/blacklist.txt # comma- or newline-separated entries
+#   file: /etc/udpshunt/blacklist.txt # comma- or newline-separated entries;
+#                                      # the admin API writes through to this
+#                                      # file (persistent across restarts)
 #   watch_interval: 5s # poll the file for changes; 0 disables watching
 #   log_blocked: false # request-log one line PER dropped packet (loud under attack)

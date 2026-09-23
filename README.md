@@ -254,13 +254,18 @@ Semantics. Config loading is fail-closed: a configured-but-missing list
 file, or any invalid entry (inline or in the file), fails config load with
 the filename in the error — at startup and on `/reload`. The file watch is
 best-effort: a missing or half-written file keeps the previous list, logs
-an error and is retried on the next tick. Entries added at runtime via the
-API survive reloads; a runtime DELETE of a config-sourced entry lasts only
-until the next config-source refresh (a `/reload` or a watched-file
-change) — the entry comes back if it is still in the config or file
-(logged at Info) and stays away if it was removed there. Runtime changes
-are never persisted: to unblock an address permanently, remove it from the
-config or list file.
+an error and is retried on the next tick.
+
+Persistence. **When `blacklist.file` is configured, the runtime API writes
+through to that file**: `POST` appends the entry, `DELETE` removes it, so
+API-made changes survive restarts — and a `DELETE` of a file-sourced entry
+is permanent (the next reload cannot resurrect what the file no longer
+carries). A failed file write refuses the operation entirely (HTTP 500,
+in-memory list unchanged). Entries in the yaml `entries` list are never
+rewritten by the API; deleting one lasts only until the next config-source
+refresh (a `/reload` or a watched-file change) — remove it from the yaml to
+delete it permanently. Without a `file`, runtime changes are memory-only
+and gone on restart, though they still survive reloads.
 
 Admin API on the admin port:
 

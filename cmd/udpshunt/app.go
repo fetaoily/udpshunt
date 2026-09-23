@@ -7,7 +7,9 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -280,6 +282,79 @@ func canonicalizeEntries(entries []string) ([]string, error) {
 	return out, nil
 }
 
+// appendListEntry appends one canonical entry as a new line to the list
+// file, creating the file if absent. It is the persistence half of
+// BlacklistAdd: the file is written BEFORE any in-memory change, so an
+// unpersistable add is refused entirely. Hand-edited files often lack the
+// trailing newline; without the separator check the appended entry would
+// glue onto the last line and change its meaning.
+func appendListEntry(path, canonical string) error {
+	sep := ""
+	if b, err := os.ReadFile(path); err == nil {
+		if len(b) > 0 && b[len(b)-1] != '\n' && b[len(b)-1] != ',' {
+			sep = "\n"
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := fmt.Fprintf(f, "%s%s\n", sep, canonical); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// rewriteListFileWithout rewrites the list file without the canonical
+// entry (atomic temp file + rename in the same directory). removed
+// reports whether the file carried the entry at all; a missing file
+// simply removes nothing.
+func rewriteListFileWithout(path, canonical string) (removed bool, err error) {
+	entries, err := blocklist.ReadFileEntries(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	can, err := canonicalizeEntries(entries)
+	if err != nil {
+		return false, err
+	}
+	if !slices.Contains(can, canonical) {
+		return false, nil
+	}
+	lines := make([]string, 0, len(can)-1)
+	for _, e := range can {
+		if e != canonical {
+			lines = append(lines, e)
+		}
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "blacklist-*.tmp")
+	if err != nil {
+		return false, err
+	}
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+	if _, err := tmp.WriteString(strings.Join(lines, "\n") + "\n"); err != nil {
+		tmp.Close()
+		return false, err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return false, err
+	}
+	if err := tmp.Close(); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // blacklistEntryPrefix parses one blacklist entry (bare IP or CIDR) into a
 // canonical prefix for session-eviction predicates, mirroring blocklist's
 // normalization: bare IPs become host-length prefixes, IPv4-mapped
@@ -315,15 +390,19 @@ func closeBlacklistClients(mgr *session.Manager, p netip.Prefix) int {
 
 // BlacklistAdd blocks entry at runtime (spec §7): it validates, folds into
 // the union and closes the entry's live sessions immediately. The entry is
-// stored under its canonical form (what GET /blacklist reports), and a
-// runtime add lives until restart — reloads do not drop it. The closure
-// runs before the rebuild so the count is attributed to blacklist_added;
-// the rebuild's diff sweep then finds nothing left to close for it. The
-// whole sequence holds a.mu and ends in the same state either way (list
-// swapped, sessions gone), so the sub-moment ordering is not observable.
+// stored under its canonical form (what GET /blacklist reports). With a
+// list file configured the add is PERSISTED: the file is appended first,
+// so the entry survives restarts and a failed write refuses the add
+// entirely (the file is the source of truth). Without a file the add is
+// memory-only and lives until restart — reloads do not drop it either
+// way. The closure runs before the rebuild so the count is attributed to
+// blacklist_added; the rebuild's diff sweep then finds nothing left to
+// close for it. The whole sequence holds a.mu and ends in the same state
+// either way (list swapped, sessions gone), so the sub-moment ordering is
+// not observable.
 func (a *App) BlacklistAdd(entry string) error {
 	if _, err := blocklist.New([]string{entry}); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", blocklist.ErrInvalidEntry, err)
 	}
 	p, err := blacklistEntryPrefix(entry)
 	if err != nil {
@@ -332,6 +411,17 @@ func (a *App) BlacklistAdd(entry string) error {
 	canonical := p.String()
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if file := a.cfg.Blacklist.File; file != "" {
+		if err := appendListEntry(file, canonical); err != nil {
+			return fmt.Errorf("blacklist: persist entry to list file: %w", err)
+		}
+		// Keep the config-source cache in step with the file just written
+		// so the watcher's content dedup treats its next poll as a no-op
+		// instead of firing a spurious blacklist_reloaded event.
+		if !slices.Contains(a.blCfgEntries, canonical) {
+			a.blCfgEntries = append(a.blCfgEntries, canonical)
+		}
+	}
 	n := closeBlacklistClients(a.mgr, p)
 	delete(a.blDels, canonical)
 	a.blAdds[canonical] = struct{}{}
@@ -347,14 +437,17 @@ func (a *App) BlacklistAdd(entry string) error {
 }
 
 // BlacklistDel removes entry from the effective blacklist. Delete
-// semantics (as ruled in review): a runtime delete of a config-sourced
-// entry lasts only until the next config-source refresh — an Apply or a
-// watcher file reload — which resurrects entries still present in config
-// (permanent removal means removing them from config); a deleted runtime
-// add stays away, since it leaves blAdds. The lookup is by canonical form,
-// so any spelling that parses to the same entry resolves. An entry that is
-// not effective — never present, already deleted, or unparseable — yields
-// an os.ErrNotExist so the admin route can map it to 404.
+// semantics (as ruled in review): with a list file configured, a
+// file-sourced entry is REMOVED FROM THE FILE first — the unblock is
+// permanent and survives restarts; a failed rewrite refuses the delete
+// entirely. A runtime delete of a yaml-sourced entry lasts only until the
+// next config-source refresh — an Apply or a watcher file reload — which
+// resurrects entries still present in the yaml (permanent removal means
+// removing them from the yaml); a deleted runtime add stays away, since it
+// leaves blAdds. The lookup is by canonical form, so any spelling that
+// parses to the same entry resolves. An entry that is not effective —
+// never present, already deleted, or unparseable — yields an
+// os.ErrNotExist so the admin route can map it to 404.
 func (a *App) BlacklistDel(entry string) error {
 	p, err := blacklistEntryPrefix(entry)
 	if err != nil {
@@ -365,6 +458,15 @@ func (a *App) BlacklistDel(entry string) error {
 	defer a.mu.Unlock()
 	if _, ok := a.blEffective[canonical]; !ok {
 		return fmt.Errorf("blacklist: entry %q: %w", entry, os.ErrNotExist)
+	}
+	if file := a.cfg.Blacklist.File; file != "" {
+		removed, err := rewriteListFileWithout(file, canonical)
+		if err != nil {
+			return fmt.Errorf("blacklist: persist removal to list file: %w", err)
+		}
+		if removed {
+			a.blCfgEntries = slices.DeleteFunc(a.blCfgEntries, func(e string) bool { return e == canonical })
+		}
 	}
 	delete(a.blAdds, canonical)
 	a.blDels[canonical] = struct{}{}

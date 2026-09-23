@@ -16,6 +16,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/fetaoily/udpshunt/internal/blocklist"
 	"github.com/fetaoily/udpshunt/internal/clientstats"
 )
 
@@ -255,7 +256,10 @@ func TestBlacklistRoutes(t *testing.T) {
 		},
 		BlacklistAdd: func(entry string) error {
 			if entry == "not-an-ip" {
-				return fmt.Errorf("blocklist: invalid entry %q", entry)
+				return fmt.Errorf("%w: %q", blocklist.ErrInvalidEntry, entry)
+			}
+			if entry == "disk-full" {
+				return fmt.Errorf("blacklist: persist entry to list file: no space left")
 			}
 			return nil
 		},
@@ -327,6 +331,15 @@ func TestBlacklistRoutes(t *testing.T) {
 	resp5.Body.Close()
 	if resp5.StatusCode != http.StatusNoContent {
 		t.Fatalf("POST valid entry = %d, want 204", resp5.StatusCode)
+	}
+	// POST: non-validation failure (e.g. list file unwritable) -> 500.
+	respPersist, err := http.Post(ts.URL+"/blacklist", "application/json", strings.NewReader(`{"entry":"disk-full"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	respPersist.Body.Close()
+	if respPersist.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("POST persist failure = %d, want 500", respPersist.StatusCode)
 	}
 
 	// DELETE: missing param -> 400.

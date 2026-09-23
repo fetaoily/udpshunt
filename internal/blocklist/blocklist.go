@@ -12,6 +12,7 @@
 package blocklist
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -19,6 +20,11 @@ import (
 	"strings"
 	"sync/atomic"
 )
+
+// ErrInvalidEntry is wrapped by entry-validation failures so HTTP layers
+// can distinguish a bad entry (400) from other failures such as a list
+// file that cannot be written (500).
+var ErrInvalidEntry = errors.New("blocklist: invalid entry")
 
 // List is an immutable set of blocked client IPs, normalized to netip.Prefix
 // form. Exact addresses are stored as host-length prefixes in a map keyed by

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fetaoily/udpshunt/internal/blocklist"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -239,7 +240,11 @@ func (s *Server) handleBlacklistAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.deps.BlacklistAdd(req.Entry); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		if errors.Is(err, blocklist.ErrInvalidEntry) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

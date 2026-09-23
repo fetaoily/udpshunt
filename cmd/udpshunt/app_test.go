@@ -22,6 +22,7 @@ import (
 
 	"github.com/fetaoily/udpshunt/internal/admin"
 	"github.com/fetaoily/udpshunt/internal/balancer"
+	"github.com/fetaoily/udpshunt/internal/blocklist"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/webui"
 )
@@ -889,7 +890,7 @@ func TestBlacklistRuntimeAPIAndReload(t *testing.T) {
 }
 
 // Ruled delete semantics: a runtime delete of a config-sourced entry lasts
-// only until the next config-source refresh (Apply or watcher reload) — the
+// only until the next config-source refresh (Apply or watcher reload) �?the
 // entry still present in config comes back; a runtime add survives reloads.
 func TestBlacklistDeleteUntilNextRefresh(t *testing.T) {
 	b1 := startEcho(t)
@@ -946,7 +947,7 @@ func TestBlacklistDeleteUntilNextRefresh(t *testing.T) {
 // blocklist.New rejects it) must leave the runtime state untouched: the
 // swapped list and the armed runtime deletes survive, so a later API
 // rebuild still honors the delete. config.Load rejects such entries, so the
-// test hands Apply a hand-built config — the same rebuild the watcher's
+// test hands Apply a hand-built config �?the same rebuild the watcher's
 // file path can hit, driven synchronously.
 func TestBlacklistFailedRebuildKeepsRuntimeState(t *testing.T) {
 	b1 := startEcho(t)
@@ -1096,7 +1097,7 @@ func TestBlacklistWatch(t *testing.T) {
 
 // A stopped listener's balancer must have its state-change callback detached:
 // an in-flight probe from the old prober can report up to one timeout after
-// Stop, and the old callback — keyed by listener name — would close the
+// Stop, and the old callback �?keyed by listener name �?would close the
 // sessions of a same-named RESTARTED listener.
 func TestStoppedListenerCallbackDetached(t *testing.T) {
 	backend, kill := startEchoCtl(t)
@@ -1142,5 +1143,113 @@ listeners:
 		if e.Kind == "backend_suspect" || e.Kind == "backend_down" || e.Kind == "backend_up" {
 			t.Fatalf("stopped listener's balancer must not fire callbacks: %+v", e)
 		}
+	}
+}
+
+// blacklistFileCfg writes a config with one listener and a blacklist file.
+func blacklistFileCfg(t *testing.T, backend string, blFile string) string {
+	t.Helper()
+	yamlPath := strings.ReplaceAll(blFile, "\\", "/")
+	return writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", backend),
+		fmt.Sprintf("blacklist:\n  file: %s\n", yamlPath)))
+}
+
+func blFileContains(t *testing.T, path, canonical string) bool {
+	t.Helper()
+	entries, err := blocklist.ReadFileEntries(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	can, err := canonicalizeEntries(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return slices.Contains(can, canonical)
+}
+
+// With a list file configured, a runtime add persists to the file and thus
+// survives a restart (a fresh App on the same config).
+func TestBlacklistAddPersistsToFile(t *testing.T) {
+	backend := startEcho(t)
+	blFile := filepath.Join(t.TempDir(), "bl.txt")
+	if err := os.WriteFile(blFile, []byte("203.0.113.7"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := blacklistFileCfg(t, backend, blFile)
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.BlacklistAdd("198.51.100.9"); err != nil {
+		t.Fatal(err)
+	}
+	if !blFileContains(t, blFile, "198.51.100.9/32") {
+		t.Fatal("runtime add must persist to the list file")
+	}
+	// Restart: a fresh app on the same config loads the added entry.
+	app2, _ := newApp(t, p)
+	if err := app2.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(app2.Blacklist().Entries, "198.51.100.9/32") {
+		t.Fatalf("added entry must survive restart: %v", app2.Blacklist().Entries)
+	}
+}
+
+// With a list file configured, a runtime delete removes the entry from the
+// file: the unblock is permanent, not reverted by the next reload.
+func TestBlacklistDelRemovesFromFile(t *testing.T) {
+	backend := startEcho(t)
+	blFile := filepath.Join(t.TempDir(), "bl.txt")
+	if err := os.WriteFile(blFile, []byte("203.0.113.7,198.51.100.9"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := blacklistFileCfg(t, backend, blFile)
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.BlacklistDel("198.51.100.9"); err != nil {
+		t.Fatal(err)
+	}
+	if blFileContains(t, blFile, "198.51.100.9/32") {
+		t.Fatal("runtime delete must remove the entry from the list file")
+	}
+	// Reload resurrects nothing: the file no longer carries the entry.
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(app.Blacklist().Entries, "198.51.100.9/32") {
+		t.Fatal("deleted file entry must stay deleted after reload")
+	}
+}
+
+// A failed file write must not change the effective list: the file is the
+// source of truth, so an unpersistable add is refused entirely.
+func TestBlacklistAddPersistFailureKeepsState(t *testing.T) {
+	backend := startEcho(t)
+	blFile := filepath.Join(t.TempDir(), "bl.txt")
+	if err := os.WriteFile(blFile, []byte("203.0.113.7"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := blacklistFileCfg(t, backend, blFile)
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(blFile, 0o444); err != nil { // read-only: appends fail
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blFile, 0o644) })
+	err := app.BlacklistAdd("198.51.100.9")
+	if err == nil {
+		t.Fatal("add must fail when the list file cannot be written")
+	}
+	if errors.Is(err, blocklist.ErrInvalidEntry) {
+		t.Fatalf("persist failure misreported as validation error: %v", err)
+	}
+	if slices.Contains(app.Blacklist().Entries, "198.51.100.9/32") {
+		t.Fatal("failed persist must leave the effective list unchanged")
 	}
 }
