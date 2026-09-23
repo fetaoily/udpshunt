@@ -888,6 +888,60 @@ func TestBlacklistRuntimeAPIAndReload(t *testing.T) {
 	}
 }
 
+// Ruled delete semantics: a runtime delete of a config-sourced entry lasts
+// only until the next config-source refresh (Apply or watcher reload) — the
+// entry still present in config comes back; a runtime add survives reloads.
+func TestBlacklistDeleteUntilNextRefresh(t *testing.T) {
+	b1 := startEcho(t)
+	pA := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1),
+		"blacklist:\n  entries: [203.0.113.7]\n"))
+	app, _ := newApp(t, pA)
+	if err := app.Apply(context.Background(), mustLoad(t, pA)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete via the exact string GET /blacklist reports (canonical form;
+	// the config spelled the entry bare): it leaves the effective list.
+	if err := app.BlacklistDel("203.0.113.7/32"); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(app.Blacklist().Entries, "203.0.113.7/32") {
+		t.Fatal("deleted entry must leave the list")
+	}
+
+	// The same config applied again resurrects it, while a runtime add made
+	// before that reload survives it.
+	if err := app.BlacklistAdd("192.0.2.77"); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Apply(context.Background(), mustLoad(t, pA)); err != nil {
+		t.Fatal(err)
+	}
+	entries := app.Blacklist().Entries
+	if !slices.Contains(entries, "203.0.113.7/32") {
+		t.Fatalf("config-sourced entry must come back on reload, got %v", entries)
+	}
+	if !slices.Contains(entries, "192.0.2.77/32") {
+		t.Fatalf("runtime add must survive the reload, got %v", entries)
+	}
+
+	// Removing the entry from config keeps it away across reloads.
+	pB := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1),
+		"blacklist:\n  entries: [198.51.100.7]\n"))
+	if err := app.Apply(context.Background(), mustLoad(t, pB)); err != nil {
+		t.Fatal(err)
+	}
+	entries = app.Blacklist().Entries
+	if slices.Contains(entries, "203.0.113.7/32") {
+		t.Fatalf("entry removed from config must stay away, got %v", entries)
+	}
+	if !slices.Contains(entries, "198.51.100.7/32") || !slices.Contains(entries, "192.0.2.77/32") {
+		t.Fatalf("new config entry and runtime add must be effective, got %v", entries)
+	}
+}
+
 func TestStatusBlacklistBlockedPackets(t *testing.T) {
 	b1 := startEcho(t)
 	p := writeCfg(t, cfgYAML(fmt.Sprintf(
@@ -954,12 +1008,27 @@ func TestBlacklistWatch(t *testing.T) {
 		t.Fatal("blacklist_reloaded event missing")
 	}
 
+	// A runtime delete of a file-sourced entry lasts until the next
+	// watcher refresh that still carries it: it comes back when the file
+	// includes it again (delete here uses the bare spelling GET never
+	// shows, so this also pins the canonical DELETE lookup).
+	if err := app.BlacklistDel("198.51.100.5"); err != nil {
+		t.Fatal(err)
+	}
+	if contains("198.51.100.5/32") {
+		t.Fatal("deleted file entry must leave the list")
+	}
+	if err := os.WriteFile(blFile, []byte("198.51.100.5,192.0.2.8"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return contains("198.51.100.5/32") && contains("192.0.2.8/32") })
+
 	// A broken file keeps the previous list (best-effort watch).
 	if err := os.WriteFile(blFile, []byte("not-an-ip"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(500 * time.Millisecond)
-	if !contains("198.51.100.5/32") || len(app.Blacklist().Entries) != 1 {
+	if !contains("198.51.100.5/32") || !contains("192.0.2.8/32") || len(app.Blacklist().Entries) != 2 {
 		t.Fatalf("broken file must not change the list, got %v", app.Blacklist().Entries)
 	}
 

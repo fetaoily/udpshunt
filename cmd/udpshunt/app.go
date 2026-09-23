@@ -37,13 +37,17 @@ type App struct {
 	reqLog      *requestlog.Logger
 	clientStats *clientstats.Table
 
-	// Blacklist (spec §7): one shared container behind every listener plus
-	// the dedicated blocked-traffic table (nil without a blacklist
-	// section). blAdds/blDels are the runtime deltas over the config
-	// source; blEffective mirrors the swapped list for reload diffing;
-	// blCfgEntries is the config portion (inline + file) the watcher
-	// rebuilds from. All four live under a.mu — none sit on the packet
-	// path.
+	// Blacklist (spec §7, delete semantics as ruled in review): one shared
+	// container behind every listener plus the dedicated blocked-traffic
+	// table (nil without a blacklist section). blAdds are runtime
+	// additions and live until restart; blDels are runtime deletions and
+	// live only until the next config-source refresh (Apply or watcher
+	// reload), when entries still present in config come back. blEffective
+	// mirrors the swapped list for reload diffing; blCfgEntries is the
+	// canonical config portion (inline + file) the watcher rebuilds from.
+	// All four live under a.mu — none sit on the packet path. Set keys are
+	// the canonical entry form, so GET /blacklist output and DELETE
+	// lookups agree regardless of how an entry was spelled.
 	bl           *blocklist.Container
 	blockedStats *clientstats.Table
 	blAdds       map[string]struct{}
@@ -157,7 +161,7 @@ func (a *App) Apply(ctx context.Context, cfg config.Config) error {
 		}
 		cfgEntries = append(cfgEntries, fileEntries...)
 	}
-	if err := a.rebuildBlacklistLocked(cfgEntries); err != nil {
+	if err := a.rebuildBlacklistLocked(cfgEntries, true); err != nil {
 		return fmt.Errorf("blacklist: %w", err)
 	}
 	for _, l := range a.listeners {
@@ -171,11 +175,32 @@ func (a *App) Apply(ctx context.Context, cfg config.Config) error {
 // rebuildBlacklistLocked recomputes the effective blacklist — cfgEntries ∪
 // blAdds − blDels — swaps it into the container and closes the live sessions
 // of every newly blocked entry (diff over the previous effective set, spec
-// §6). It also records cfgEntries as the config portion the watcher rebuilds
-// from. Callers hold a.mu; never on the packet path.
-func (a *App) rebuildBlacklistLocked(cfgEntries []string) error {
-	eff := make(map[string]struct{}, len(cfgEntries)+len(a.blAdds))
-	for _, e := range cfgEntries {
+// §6). With refreshCfg (Apply and the watcher: the config source was just
+// re-read) runtime deletes are discarded first, so config-sourced entries
+// deleted at runtime come back — each resurrection is logged; API-triggered
+// rebuilds (Add/Del) keep the runtime deletes. All sets are keyed by the
+// canonical entry form. It also records the canonical cfgEntries as the
+// config portion the watcher rebuilds from. Callers hold a.mu; never on the
+// packet path.
+func (a *App) rebuildBlacklistLocked(cfgEntries []string, refreshCfg bool) error {
+	can, err := canonicalizeEntries(cfgEntries)
+	if err != nil {
+		return err
+	}
+	var wasDeleted map[string]struct{}
+	if refreshCfg {
+		// A config-source refresh re-evaluates the config from scratch:
+		// runtime deletes are discarded (entries still present in config
+		// come back; entries removed from config stay away naturally).
+		// Runtime adds are untouched.
+		wasDeleted = make(map[string]struct{}, len(a.blDels))
+		for e := range a.blDels {
+			wasDeleted[e] = struct{}{}
+			delete(a.blDels, e)
+		}
+	}
+	eff := make(map[string]struct{}, len(can)+len(a.blAdds))
+	for _, e := range can {
 		eff[e] = struct{}{}
 	}
 	for e := range a.blAdds {
@@ -191,6 +216,15 @@ func (a *App) rebuildBlacklistLocked(cfgEntries []string) error {
 	list, err := blocklist.New(entries)
 	if err != nil {
 		return err
+	}
+	revived := 0
+	for e := range wasDeleted {
+		if _, ok := eff[e]; ok {
+			revived++
+		}
+	}
+	if revived > 0 {
+		a.logger.Info("blacklist: config-sourced entries re-activated on reload", "n", revived)
 	}
 	// Evict sessions only for entries that are newly effective; removals
 	// never close anything and unchanged entries were swept when they
@@ -212,8 +246,25 @@ func (a *App) rebuildBlacklistLocked(cfgEntries []string) error {
 	}
 	a.bl.Swap(list)
 	a.blEffective = eff
-	a.blCfgEntries = cfgEntries
+	a.blCfgEntries = can
 	return nil
+}
+
+// canonicalizeEntries maps entries to their canonical form (blocklist's
+// normalized prefix string, e.g. "203.0.113.7" -> "203.0.113.7/32"), the
+// form GET /blacklist reports. All blacklist sets are keyed this way so a
+// DELETE by the spelling in config, in the list file, or from GET all
+// resolve to the same set key.
+func canonicalizeEntries(entries []string) ([]string, error) {
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		p, err := blacklistEntryPrefix(e)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p.String())
+	}
+	return out, nil
 }
 
 // blacklistEntryPrefix parses one blacklist entry (bare IP or CIDR) into a
@@ -250,7 +301,9 @@ func closeBlacklistClients(mgr *session.Manager, p netip.Prefix) int {
 }
 
 // BlacklistAdd blocks entry at runtime (spec §7): it validates, folds into
-// the union and closes the entry's live sessions immediately. The closure
+// the union and closes the entry's live sessions immediately. The entry is
+// stored under its canonical form (what GET /blacklist reports), and a
+// runtime add lives until restart — reloads do not drop it. The closure
 // runs before the rebuild so the count is attributed to blacklist_added;
 // the rebuild's diff sweep then finds nothing left to close for it. The
 // whole sequence holds a.mu and ends in the same state either way (list
@@ -259,43 +312,54 @@ func (a *App) BlacklistAdd(entry string) error {
 	if _, err := blocklist.New([]string{entry}); err != nil {
 		return err
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	p, err := blacklistEntryPrefix(entry)
 	if err != nil {
 		return err // unreachable after the blocklist.New validation above
 	}
+	canonical := p.String()
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	n := closeBlacklistClients(a.mgr, p)
-	delete(a.blDels, entry)
-	a.blAdds[entry] = struct{}{}
-	if err := a.rebuildBlacklistLocked(a.blCfgEntries); err != nil {
+	delete(a.blDels, canonical)
+	a.blAdds[canonical] = struct{}{}
+	if err := a.rebuildBlacklistLocked(a.blCfgEntries, false); err != nil {
 		// Only possible for a set that already passed validation; roll the
 		// runtime delta back and keep the previous container list.
-		delete(a.blAdds, entry)
+		delete(a.blAdds, canonical)
 		return err
 	}
-	a.events.Add("blacklist_added", fmt.Sprintf("%s closed=%d", entry, n))
-	a.logger.Info("blacklist entry added", "entry", entry, "closed", n)
+	a.events.Add("blacklist_added", fmt.Sprintf("%s closed=%d", canonical, n))
+	a.logger.Info("blacklist entry added", "entry", canonical, "closed", n)
 	return nil
 }
 
-// BlacklistDel removes entry from the effective blacklist (spec §7: a
-// runtime delete wins over config entries and runtime adds until a reload
-// that still carries the entry). An entry that is not effective is an
-// os.ErrNotExist so the admin route can map it to 404.
+// BlacklistDel removes entry from the effective blacklist. Delete
+// semantics (as ruled in review): a runtime delete of a config-sourced
+// entry lasts only until the next config-source refresh — an Apply or a
+// watcher file reload — which resurrects entries still present in config
+// (permanent removal means removing them from config); a deleted runtime
+// add stays away, since it leaves blAdds. The lookup is by canonical form,
+// so any spelling that parses to the same entry resolves. An entry that is
+// not effective — never present, already deleted, or unparseable — yields
+// an os.ErrNotExist so the admin route can map it to 404.
 func (a *App) BlacklistDel(entry string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if _, ok := a.blEffective[entry]; !ok {
+	p, err := blacklistEntryPrefix(entry)
+	if err != nil {
 		return fmt.Errorf("blacklist: entry %q: %w", entry, os.ErrNotExist)
 	}
-	delete(a.blAdds, entry)
-	a.blDels[entry] = struct{}{}
-	if err := a.rebuildBlacklistLocked(a.blCfgEntries); err != nil {
+	canonical := p.String()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.blEffective[canonical]; !ok {
+		return fmt.Errorf("blacklist: entry %q: %w", entry, os.ErrNotExist)
+	}
+	delete(a.blAdds, canonical)
+	a.blDels[canonical] = struct{}{}
+	if err := a.rebuildBlacklistLocked(a.blCfgEntries, false); err != nil {
 		return err
 	}
-	a.events.Add("blacklist_removed", entry)
-	a.logger.Info("blacklist entry removed", "entry", entry)
+	a.events.Add("blacklist_removed", canonical)
+	a.logger.Info("blacklist entry removed", "entry", canonical)
 	return nil
 }
 
@@ -704,16 +768,24 @@ func (a *App) pollBlacklistFile(path string, goodMod *time.Time, goodSize *int64
 	}
 	a.mu.Lock()
 	// The fresh file replaces the previous file portion of the config
-	// source; inline entries and runtime adds/dels carry over.
+	// source; inline entries and runtime adds carry over, while the refresh
+	// drops runtime deletes (config-sourced entries still in the file come
+	// back). Canonicalize before the content check: the sets are keyed by
+	// canonical entry form.
 	combined := append(slices.Clone(a.cfg.Blacklist.Entries), entries...)
-	if sameStringSet(combined, a.blCfgEntries) {
+	can, cerr := canonicalizeEntries(combined)
+	switch {
+	case cerr != nil:
+		err = cerr
+	case sameStringSet(can, a.blCfgEntries):
 		// Content already applied (the watcher's first sight of the file
 		// after Apply): remember the stat without re-swapping or eventing.
 		a.mu.Unlock()
 		*goodMod, *goodSize = fi.ModTime(), fi.Size()
 		return
+	default:
+		err = a.rebuildBlacklistLocked(can, true)
 	}
-	err = a.rebuildBlacklistLocked(combined)
 	a.mu.Unlock()
 	if err != nil {
 		a.logger.Error("blacklist watch: reload failed, keeping previous list", "file", path, "err", err)
