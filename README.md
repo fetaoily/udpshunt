@@ -230,6 +230,65 @@ warning and keeps running with client stats disabled. The table is served
 by `GET /clients` (below) and rendered in the TUI (`c` key) and in the web
 UI's clients panel.
 
+### Blacklist
+
+The optional top-level `blacklist` blocks client IPs: packets from a
+blacklisted client are dropped silently before forwarding — no session, no
+reply — and blocking an IP immediately closes its live sessions. Blocked
+traffic is counted per-IP in a dedicated table, separate from the normal
+clients view.
+
+```yaml
+blacklist:
+  entries:                            # exact IPs and CIDR prefixes
+    - 203.0.113.7
+    - 198.51.100.0/24
+  file: /etc/udpshunt/blacklist.txt   # comma- or newline-separated list,
+                                      # unioned with entries
+  watch_interval: 5s                  # poll the file for changes; 0 (or
+                                      # omitting it) disables watching
+  log_blocked: false                  # request-log every dropped packet
+```
+
+Semantics. Config loading is fail-closed: a configured-but-missing list
+file, or any invalid entry (inline or in the file), fails config load with
+the filename in the error — at startup and on `/reload`. The file watch is
+best-effort: a missing or half-written file keeps the previous list, logs
+an error and is retried on the next tick. Entries added at runtime via the
+API survive reloads; a runtime DELETE of a config-sourced entry lasts only
+until the next config-source refresh (a `/reload` or a watched-file
+change) — the entry comes back if it is still in the config or file
+(logged at Info) and stays away if it was removed there. Runtime changes
+are never persisted: to unblock an address permanently, remove it from the
+config or list file.
+
+Admin API on the admin port:
+
+    curl http://127.0.0.1:9155/blacklist
+    curl -X POST http://127.0.0.1:9155/blacklist -d '{"entry":"203.0.113.7"}'
+    curl -X DELETE 'http://127.0.0.1:9155/blacklist?entry=203.0.113.7%2F32'
+
+`GET` returns the canonical entries (`203.0.113.7` reports as
+`203.0.113.7/32`), the `log_blocked` flag and the `blocked_packets`
+counter. `POST` takes `{"entry":"<ip or cidr>"}` and answers `400` on an
+invalid entry; `DELETE` takes the URL-encoded `entry` query parameter and
+answers `404` for an entry that is not blocked. Both mutating routes
+answer `204` on success.
+
+Observability: dropped packets accumulate in the
+`udpshunt_blacklisted_packets_total` metric (label `listener`), `/status`
+carries a `blacklist` block, and the event stream reports
+`blacklist_added`, `blacklist_removed`, `blacklist_enforced` and
+`blacklist_reloaded`. The TUI dashboard header shows `blocked N` while
+packets are being dropped, and the `b` key in the TUI clients view toggles
+the blocked-clients table (`GET /clients?scope=blocked` is the API
+equivalent).
+
+**`log_blocked: true` writes one request-log line per dropped packet.**
+Under an active attack that is one line per attack packet per second,
+matching the attack rate. Keep it off except for targeted, low-volume
+auditing.
+
 ### Balancing modes
 
 `balance` selects how new sessions pick a backend:
@@ -314,11 +373,12 @@ serving.
 
 ## Admin API
 
-`admin.bind` serves five routes:
+`admin.bind` serves eight routes:
 
 - `GET /metrics` — Prometheus text format (private registry, `udpshunt_` prefix).
-- `GET /status` — JSON snapshot: uptime, per-listener backends (health, session counts, plus per-backend `suspect`, `err_count`, `last_error` and `confirmed_by`; `confirmed_by` reflects the most recent down and persists after recovery, so it is meaningful only while the backend is down), session totals, request-log state (`dropped` counter), recent events, and per-listener rate history (last 5 min at 1s samples).
+- `GET /status` — JSON snapshot: uptime, per-listener backends (health, session counts, plus per-backend `suspect`, `err_count`, `last_error` and `confirmed_by`; `confirmed_by` reflects the most recent down and persists after recovery, so it is meaningful only while the backend is down), session totals, request-log state (`dropped` counter), blacklist state (canonical entries and the blocked-packet total), recent events, and per-listener rate history (last 5 min at 1s samples).
 - `GET /clients` — per-client-IP table (`?sort=<column>&order=asc|desc&limit=<n>`, default `requests`/`desc`/200; columns: `ip`, `requests`, `responses`, `bytes_in`, `bytes_out`, `pps_in`, `bps_in`, `bps_out`, `last_seen`). Returns `{enabled, tracked, evicted, rows}`.
+- `GET`/`POST`/`DELETE /blacklist` — runtime client-IP blocking (see [Blacklist](#blacklist)).
 - `POST /reload` — reload the config file and apply it.
 - `GET /ui` — the embedded web dashboard (below).
 
