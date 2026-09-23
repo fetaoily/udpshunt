@@ -285,10 +285,22 @@ func canonicalizeEntries(entries []string) ([]string, error) {
 // appendListEntry appends one canonical entry as a new line to the list
 // file, creating the file if absent. It is the persistence half of
 // BlacklistAdd: the file is written BEFORE any in-memory change, so an
-// unpersistable add is refused entirely. Hand-edited files often lack the
+// unpersistable add is refused entirely. The append is IDEMPOTENT — an
+// entry the file already carries is not written again, so repeated API
+// adds cannot pile up duplicate lines. Hand-edited files often lack the
 // trailing newline; without the separator check the appended entry would
-// glue onto the last line and change its meaning.
+// glue onto the last line and change its meaning. List files are sized
+// for hundreds of entries, so the two reads are not a concern.
 func appendListEntry(path, canonical string) error {
+	if entries, err := blocklist.ReadFileEntries(path); err == nil {
+		if can, err := canonicalizeEntries(entries); err == nil && slices.Contains(can, canonical) {
+			return nil
+		}
+		// A parse error here resurfaces (fail-closed) at the rebuild after
+		// the append; treat the entry as absent and let that report it.
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	sep := ""
 	if b, err := os.ReadFile(path); err == nil {
 		if len(b) > 0 && b[len(b)-1] != '\n' && b[len(b)-1] != ',' {

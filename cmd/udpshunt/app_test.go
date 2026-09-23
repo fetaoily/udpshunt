@@ -1253,3 +1253,36 @@ func TestBlacklistAddPersistFailureKeepsState(t *testing.T) {
 		t.Fatal("failed persist must leave the effective list unchanged")
 	}
 }
+
+// Repeated adds of the same entry must not pile up duplicate lines in the
+// list file: the append is idempotent.
+func TestBlacklistAddIdempotent(t *testing.T) {
+	backend := startEcho(t)
+	blFile := filepath.Join(t.TempDir(), "bl.txt")
+	if err := os.WriteFile(blFile, []byte("203.0.113.7"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := blacklistFileCfg(t, backend, blFile)
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := app.BlacklistAdd("198.51.100.9"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := blocklist.ReadFileEntries(blFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, e := range entries {
+		if e == "198.51.100.9/32" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("file carries %d copies of the entry, want 1: %v", count, entries)
+	}
+}
