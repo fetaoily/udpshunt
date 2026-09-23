@@ -176,28 +176,18 @@ func (a *App) Apply(ctx context.Context, cfg config.Config) error {
 // blAdds − blDels — swaps it into the container and closes the live sessions
 // of every newly blocked entry (diff over the previous effective set, spec
 // §6). With refreshCfg (Apply and the watcher: the config source was just
-// re-read) runtime deletes are discarded first, so config-sourced entries
-// deleted at runtime come back — each resurrection is logged; API-triggered
-// rebuilds (Add/Del) keep the runtime deletes. All sets are keyed by the
-// canonical entry form. It also records the canonical cfgEntries as the
-// config portion the watcher rebuilds from. Callers hold a.mu; never on the
-// packet path.
+// re-read) runtime deletes are discarded at commit, so config-sourced
+// entries deleted at runtime come back — each resurrection is logged;
+// API-triggered rebuilds (Add/Del) keep the runtime deletes. All sets are
+// keyed by the canonical entry form. It also records the canonical
+// cfgEntries as the config portion the watcher rebuilds from. The new
+// snapshot is fully built and validated into locals before any a.mu-guarded
+// state changes, so an error return leaves the container and the runtime
+// deltas exactly as they were. Callers hold a.mu; never on the packet path.
 func (a *App) rebuildBlacklistLocked(cfgEntries []string, refreshCfg bool) error {
 	can, err := canonicalizeEntries(cfgEntries)
 	if err != nil {
 		return err
-	}
-	var wasDeleted map[string]struct{}
-	if refreshCfg {
-		// A config-source refresh re-evaluates the config from scratch:
-		// runtime deletes are discarded (entries still present in config
-		// come back; entries removed from config stay away naturally).
-		// Runtime adds are untouched.
-		wasDeleted = make(map[string]struct{}, len(a.blDels))
-		for e := range a.blDels {
-			wasDeleted[e] = struct{}{}
-			delete(a.blDels, e)
-		}
 	}
 	eff := make(map[string]struct{}, len(can)+len(a.blAdds))
 	for _, e := range can {
@@ -206,26 +196,50 @@ func (a *App) rebuildBlacklistLocked(cfgEntries []string, refreshCfg bool) error
 	for e := range a.blAdds {
 		eff[e] = struct{}{}
 	}
-	for e := range a.blDels {
-		delete(eff, e)
+	if !refreshCfg {
+		// A refresh re-evaluates the config from scratch, so the deletes
+		// it is about to discard must not subtract from the set either;
+		// only API-triggered rebuilds honor them here.
+		for e := range a.blDels {
+			delete(eff, e)
+		}
 	}
 	entries := make([]string, 0, len(eff))
 	for e := range eff {
 		entries = append(entries, e)
 	}
+	// Last failure point: canonicalization does not reject host-bit
+	// prefixes ("10.0.0.1/24" parses, then New rejects it), so this can
+	// still error — nothing may have been mutated above here.
 	list, err := blocklist.New(entries)
 	if err != nil {
 		return err
 	}
+	// Commit phase — nothing past this point can fail. A config-source
+	// refresh re-evaluates the config from scratch: runtime deletes are
+	// discarded (entries still present in config come back; entries
+	// removed from config stay away naturally). Runtime adds are untouched.
 	revived := 0
-	for e := range wasDeleted {
-		if _, ok := eff[e]; ok {
-			revived++
+	if refreshCfg {
+		for e := range a.blDels {
+			if _, ok := eff[e]; ok {
+				revived++
+			}
+			delete(a.blDels, e)
 		}
 	}
 	if revived > 0 {
 		a.logger.Info("blacklist: config-sourced entries re-activated on reload", "n", revived)
 	}
+	// Swap BEFORE the sweep: the receive loop reads the container lock-free
+	// without a.mu, so sweeping while the old list is still authoritative
+	// would let a packet from the about-to-be-blocked client create a
+	// session that no later rebuild reaps (the entry is already effective
+	// by then). Once swapped, no new session can be created for a newly
+	// blocked entry, and the sweep below closes every pre-existing one —
+	// including any that slipped past BlacklistAdd's earlier pre-rebuild
+	// closure, since the entry still reads as newly effective here.
+	a.bl.Swap(list)
 	// Evict sessions only for entries that are newly effective; removals
 	// never close anything and unchanged entries were swept when they
 	// landed.
@@ -244,7 +258,6 @@ func (a *App) rebuildBlacklistLocked(cfgEntries []string, refreshCfg bool) error
 	if closed > 0 {
 		a.events.Add("blacklist_enforced", fmt.Sprintf("closed=%d entries=%d", closed, changed))
 	}
-	a.bl.Swap(list)
 	a.blEffective = eff
 	a.blCfgEntries = can
 	return nil

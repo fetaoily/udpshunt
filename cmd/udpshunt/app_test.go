@@ -942,6 +942,61 @@ func TestBlacklistDeleteUntilNextRefresh(t *testing.T) {
 	}
 }
 
+// A rebuild failure (a host-bit entry like "10.0.0.1/24" canonicalizes but
+// blocklist.New rejects it) must leave the runtime state untouched: the
+// swapped list and the armed runtime deletes survive, so a later API
+// rebuild still honors the delete. config.Load rejects such entries, so the
+// test hands Apply a hand-built config — the same rebuild the watcher's
+// file path can hit, driven synchronously.
+func TestBlacklistFailedRebuildKeepsRuntimeState(t *testing.T) {
+	b1 := startEcho(t)
+	p := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1),
+		"blacklist:\n  entries: [203.0.113.7, 198.51.100.9]\n"))
+	app, _ := newApp(t, p)
+	if err := app.Apply(context.Background(), mustLoad(t, p)); err != nil {
+		t.Fatal(err)
+	}
+	contains := func(entry string) bool {
+		return slices.Contains(app.Blacklist().Entries, entry)
+	}
+	if !contains("203.0.113.7/32") || !contains("198.51.100.9/32") {
+		t.Fatalf("setup: %v", app.Blacklist().Entries)
+	}
+
+	// Arm a runtime delete, then fail a refresh rebuild with an entry that
+	// canonicalizes but fails blocklist.New. Same bind as the running
+	// listener, so Apply reaches the blacklist rebuild without churn.
+	if err := app.BlacklistDel("203.0.113.7"); err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	bind := app.binds["L1"]
+	app.mu.Unlock()
+	bad := config.Config{
+		Listeners: []config.Listener{{Name: "L1", Bind: bind, Backends: []string{b1}}},
+		Blacklist: config.Blacklist{Entries: []string{"10.0.0.1/24"}},
+	}
+	if err := app.Apply(context.Background(), bad); err == nil {
+		t.Fatal("host-bit entry must fail the rebuild")
+	}
+
+	// The failed rebuild swapped nothing and kept the runtime delete armed:
+	// an API rebuild (no refresh) must not resurrect the config entry.
+	if got := app.Blacklist().Entries; len(got) != 1 || !contains("198.51.100.9/32") || contains("10.0.0.1/24") {
+		t.Fatalf("failed rebuild must keep the previous list, got %v", got)
+	}
+	if err := app.BlacklistAdd("192.0.2.50"); err != nil {
+		t.Fatal(err)
+	}
+	if contains("203.0.113.7/32") {
+		t.Fatal("runtime delete must survive a failed rebuild")
+	}
+	if !contains("192.0.2.50/32") || !contains("198.51.100.9/32") {
+		t.Fatalf("runtime add must land on the surviving list, got %v", app.Blacklist().Entries)
+	}
+}
+
 func TestStatusBlacklistBlockedPackets(t *testing.T) {
 	b1 := startEcho(t)
 	p := writeCfg(t, cfgYAML(fmt.Sprintf(
