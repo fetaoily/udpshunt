@@ -155,11 +155,12 @@ func (l *Listener) Run(ctx context.Context) error {
 		// Drain the packets already received before handling the error: a
 		// partial batch (deadline expiry during shutdown) must not be dropped.
 		for i := 0; i < n; i++ {
-			l.met.PacketsIn(1)
-			l.met.BytesIn(sizes[i])
-			l.stats.PacketIn(addrs[i].IP, sizes[i])
 			if l.bl != nil {
-				// Hot path: one atomic list load + map probe, no locks.
+				// Blocked packets bypass the receive loop's general
+				// accounting entirely (spec §9): they hit only the
+				// blacklisted counter, the blocked-stats table and the
+				// optional request log. Hot path: one atomic list load +
+				// map probe, no locks.
 				if a, ok := netip.AddrFromSlice(addrs[i].IP); ok {
 					a = a.Unmap()
 					if l.bl.Blocked(a) {
@@ -179,6 +180,9 @@ func (l *Listener) Run(ctx context.Context) error {
 					}
 				}
 			}
+			l.met.PacketsIn(1)
+			l.met.BytesIn(sizes[i])
+			l.stats.PacketIn(addrs[i].IP, sizes[i])
 			l.handle(addrs[i], bufs[i][:sizes[i]])
 		}
 		if err != nil {

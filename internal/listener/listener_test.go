@@ -16,6 +16,7 @@ import (
 	"github.com/fetaoily/udpshunt/internal/blocklist"
 	"github.com/fetaoily/udpshunt/internal/clientstats"
 	"github.com/fetaoily/udpshunt/internal/config"
+	"github.com/fetaoily/udpshunt/internal/metrics"
 	"github.com/fetaoily/udpshunt/internal/requestlog"
 	"github.com/fetaoily/udpshunt/internal/session"
 )
@@ -295,15 +296,22 @@ func TestClientStatsCounting(t *testing.T) {
 }
 
 // blacklistStack is a dedicated stack (like TestGracefulShutdown's) with a
-// blocklist container, so tests can swap lists while the listener runs.
-func blacklistStack(t *testing.T, name string, rl *requestlog.Logger, bstats *clientstats.Table) (*Listener, *session.Manager, *blocklist.Container) {
+// blocklist container, a live metrics registry and BOTH client-stats tables
+// (general + blocked), so tests can swap lists while the listener runs and
+// observe where each packet was accounted.
+func blacklistStack(t *testing.T, name string, rl *requestlog.Logger) (*Listener, *session.Manager, *blocklist.Container, *metrics.Metrics, *clientstats.Table, *clientstats.Table) {
 	t.Helper()
 	backend := startEcho(t)
 	lc := config.Listener{Name: name, Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
 	mgr := session.NewManager(0)
 	bal := balancer.New(lc.Backends, balancer.Options{})
 	bl := blocklist.NewContainer()
-	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), nil, rl, nil, bl, bstats)
+	met := metrics.New()
+	stats := clientstats.New(clientstats.Options{Dir: t.TempDir(), TickEvery: time.Hour, SnapshotInterval: time.Hour})
+	bstats := clientstats.New(clientstats.Options{Dir: t.TempDir(), TickEvery: time.Hour, SnapshotInterval: time.Hour})
+	t.Cleanup(stats.Stop)
+	t.Cleanup(bstats.Stop)
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), met.ForListener(name), rl, stats, bl, bstats)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +322,40 @@ func blacklistStack(t *testing.T, name string, rl *requestlog.Logger, bstats *cl
 	t.Cleanup(func() { mgr.CloseAll() })
 	t.Cleanup(cancel)
 	go func() { _ = l.Run(ctx) }()
-	return l, mgr, bl
+	return l, mgr, bl, met, stats, bstats
+}
+
+// counterValue sums one counter metric across all its label values (0 when
+// the counter has no children yet).
+func counterValue(t *testing.T, m *metrics.Metrics, name string) float64 {
+	t.Helper()
+	fams, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sum float64
+	for _, f := range fams {
+		if f.GetName() == name {
+			for _, mv := range f.GetMetric() {
+				sum += mv.GetCounter().GetValue()
+			}
+		}
+	}
+	return sum
+}
+
+// waitCounter polls until the named counter reaches at least v (the receive
+// loop processes packets asynchronously from the client's send).
+func waitCounter(t *testing.T, m *metrics.Metrics, name string, v float64) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if counterValue(t, m, name) >= v {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("counter %s never reached %v", name, v)
 }
 
 // blockClientAddr builds a list holding the client's own local address: a
@@ -330,9 +371,7 @@ func blockClientAddr(t *testing.T, cli *net.UDPConn) *blocklist.List {
 }
 
 func TestBlacklistedPacketDropped(t *testing.T) {
-	bstats := clientstats.New(clientstats.Options{Dir: t.TempDir(), TickEvery: time.Hour, SnapshotInterval: time.Hour})
-	t.Cleanup(bstats.Stop)
-	l, mgr, bl := blacklistStack(t, "bl", nil, bstats)
+	l, mgr, bl, met, stats, bstats := blacklistStack(t, "bl", nil)
 
 	cli := testClient(t)
 	cliIP := cli.LocalAddr().(*net.UDPAddr).IP.String()
@@ -346,18 +385,28 @@ func TestBlacklistedPacketDropped(t *testing.T) {
 	if n, _, err := cli.ReadFromUDP(buf); err == nil {
 		t.Fatalf("blacklisted client must get no reply, got %q", buf[:n])
 	}
+	// The receive loop has accounted the packet as blocked by now.
+	waitCounter(t, met, "udpshunt_blacklisted_packets_total", 1)
+
+	// A blocked packet must bypass the general accounting entirely: no
+	// traffic counters, no row in the general client-stats table.
+	if got := counterValue(t, met, "udpshunt_packets_in_total"); got != 0 {
+		t.Fatalf("packets_in counted a blocked packet: %v", got)
+	}
+	if rows, _, _ := stats.Top("requests", true, 10); len(rows) != 0 {
+		t.Fatalf("general client stats must not see a blocked packet: %+v", rows)
+	}
 	if mgr.Count() != 0 {
 		t.Fatal("blacklisted client must not create a session")
 	}
 
-	// Blocked stats recorded for that IP (poll briefly: PacketIn lands from
-	// the receive loop after the client has already given up waiting).
+	// Blocked stats recorded for that IP.
 	var row clientstats.Row
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		rows, _, _ := bstats.Top("requests", true, 10)
-		if len(rows) == 1 && rows[0].IP == cliIP && rows[0].Requests >= 1 {
-			row = rows[0]
+		brows, _, _ := bstats.Top("requests", true, 10)
+		if len(brows) == 1 && brows[0].IP == cliIP && brows[0].Requests >= 1 {
+			row = brows[0]
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -366,7 +415,7 @@ func TestBlacklistedPacketDropped(t *testing.T) {
 		t.Fatalf("blocked stats missing for %s: %+v", cliIP, row)
 	}
 
-	// Unblock -> traffic flows again.
+	// Unblock -> traffic flows again and lands in the general accounting.
 	empty, err := blocklist.New(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -375,6 +424,12 @@ func TestBlacklistedPacketDropped(t *testing.T) {
 	if got := roundTrip(t, cli, l.Addr(), "ping"); got != "echo:ping" {
 		t.Fatalf("after unblock: %q", got)
 	}
+	if got := counterValue(t, met, "udpshunt_packets_in_total"); got < 1 {
+		t.Fatalf("packets_in must count unblocked packets, got %v", got)
+	}
+	if got := counterValue(t, met, "udpshunt_blacklisted_packets_total"); got != 1 {
+		t.Fatalf("blacklisted must stay at the blocked packet only, got %v", got)
+	}
 }
 
 func TestLogBlockedWritesRequestLog(t *testing.T) {
@@ -382,7 +437,7 @@ func TestLogBlockedWritesRequestLog(t *testing.T) {
 	rl := requestlog.New(requestlog.Options{Dir: dir, RetentionDays: 30, FlushEvery: 5 * time.Millisecond})
 	t.Cleanup(rl.Stop)
 	logPath := filepath.Join(dir, "udpshunt-requests-"+time.Now().Format("2006-01-02")+".log")
-	l, _, bl := blacklistStack(t, "bl-log", rl, nil)
+	l, _, bl, _, _, _ := blacklistStack(t, "bl-log", rl)
 
 	cli := testClient(t)
 	cliIP := cli.LocalAddr().(*net.UDPAddr).IP.String()
