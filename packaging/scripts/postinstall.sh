@@ -19,6 +19,43 @@ fi
 
 systemctl daemon-reload >/dev/null 2>&1 || true
 
+# fix_blacklist_ownership: the blacklist API persists entries by creating a
+# temp file next to the configured list file, so that directory must be
+# writable by the service user (User=nobody in the shipped unit). Packages
+# install /etc/udpshunt root-owned, which would make every API mutation
+# fail with "permission denied" (observed on CentOS 7: open .../blacklist-*.tmp:
+# permission denied). chown the directory — and the list file when it exists —
+# to the service user. User-only chown: the nobody group is named differently
+# across distros (nobody/nogroup). Non-fatal by design; a failure here only
+# means API persistence needs the manual fix described in the README.
+fix_blacklist_ownership() {
+    cfg=/etc/udpshunt/udpshunt.yaml
+    [ -f "$cfg" ] || return 0
+    bf=$(awk '
+        /^blacklist:/       { inblk = 1; next }
+        inblk && /^[^ \t#]/ { inblk = 0 }
+        inblk && /^[ \t]*file:/ {
+            sub(/^[ \t]*file:[ \t]*/, "")
+            gsub(/"/, "")
+            print
+            exit
+        }' "$cfg") || true
+    [ -n "$bf" ] || return 0
+    case "$bf" in
+        /*) ;;
+        *) echo "udpshunt: blacklist file '$bf' is not an absolute path; chown it by hand (see README)."
+           return 0 ;;
+    esac
+    chown nobody "$bf" 2>/dev/null || true
+    bdir=$(dirname "$bf")
+    if chown nobody "$bdir" 2>/dev/null; then
+        echo "udpshunt: blacklist dir $bdir chowned to the service user (API persistence)."
+    else
+        echo "udpshunt: WARNING: could not chown $bdir; blacklist API writes may fail (see README)."
+    fi
+}
+fix_blacklist_ownership
+
 # report_if_dead prints the service's exit status and its last journal lines
 # when it is not running, so a failed start is visible in the install output.
 report_if_dead() {

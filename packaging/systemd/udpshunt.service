@@ -24,9 +24,15 @@ LimitNOFILE=65536
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=
-# Spec §10: the daemon owns no persistent state, so a private /tmp and
-# read-only filesystem are safe.
+# The blacklist API persists runtime entries next to the configured list
+# file, which by default lives in /etc/udpshunt: exempt that one directory
+# from the read-only mount (the package's install script chowns it to the
+# service user). A list file elsewhere needs its own ReadWritePaths entry
+# plus that ownership fix — see the README's blacklist section.
+ReadWritePaths=/etc/udpshunt
+# Private /tmp and a read-only filesystem elsewhere are safe: the request
+# log has its own LogsDirectory exemption below, the list file the one
+# above.
 PrivateTmp=true
 # The per-request log (request_log.dir default /var/log/udpshunt): created
 # and chowned to User= at start; also exempt from ProtectSystem=strict.

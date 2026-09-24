@@ -267,6 +267,18 @@ refresh (a `/reload` or a watched-file change) — remove it from the yaml to
 delete it permanently. Without a `file`, runtime changes are memory-only
 and gone on restart, though they still survive reloads.
 
+File ownership and sandbox. The service user must be able to write the
+list file's directory: `POST` and `DELETE` create a temp file there and
+rename it into place. The package's install script chowns the configured
+directory — and an existing list file — to the service user (`nobody`),
+and the shipped unit exempts `/etc/udpshunt` from its read-only sandbox
+(`ReadWritePaths=/etc/udpshunt`). If `blacklist.file` points elsewhere,
+grant both by hand: `chown nobody <dir> <file>`, plus a
+`ReadWritePaths=<dir>` entry in a unit drop-in. The drop-in only matters
+on systemd releases that enforce `ProtectSystem=strict` — older ones such
+as CentOS 7's systemd 219 ignore the setting entirely, so ownership is the
+only gate there.
+
 Admin API on the admin port:
 
     curl http://127.0.0.1:9155/blacklist
