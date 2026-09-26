@@ -529,6 +529,33 @@ func gatedStack(t *testing.T, name string, pf config.PayloadFilter) (*Listener, 
 	return l, mgr, bl, met, stats, bstats, received
 }
 
+// gatedStackWithLog is gatedStack with a request logger attached.
+func gatedStackWithLog(t *testing.T, name string, pf config.PayloadFilter, rl *requestlog.Logger) (*Listener, *session.Manager, *blocklist.Container, *metrics.Metrics, *clientstats.Table, *clientstats.Table, func() int) {
+	t.Helper()
+	backend, received := startCountingEcho(t)
+	lc := config.Listener{Name: name, Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute), PayloadFilter: pf}
+	mgr := session.NewManager(0)
+	bal := balancer.New(lc.Backends, balancer.Options{})
+	bl := blocklist.NewContainer()
+	met := metrics.New()
+	stats := clientstats.New(clientstats.Options{Dir: t.TempDir(), TickEvery: time.Hour, SnapshotInterval: time.Hour})
+	bstats := clientstats.New(clientstats.Options{Dir: t.TempDir(), TickEvery: time.Hour, SnapshotInterval: time.Hour})
+	t.Cleanup(stats.Stop)
+	t.Cleanup(bstats.Stop)
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), met.ForListener(name), rl, nil, bl, bstats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Same LIFO teardown as newStack: cancel (stop receiving) -> CloseAll
+	// (unblock downstream readers) -> Close (release the frontend socket).
+	t.Cleanup(func() { _ = l.Close() })
+	t.Cleanup(func() { mgr.CloseAll() })
+	t.Cleanup(cancel)
+	go func() { _ = l.Run(ctx) }()
+	return l, mgr, bl, met, stats, bstats, received
+}
+
 // gateRule is the canonical single-rule gate used by the tests: magic
 // 00112233 at offset 0, min_length 4.
 var gateRule = payloadfilter.RuleConfig{MagicHex: "00112233", Offset: 0, MinLength: 4}
@@ -673,5 +700,50 @@ func TestUpdateRulesNilReopensGate(t *testing.T) {
 	}
 	if got := received(); got != 1 {
 		t.Fatalf("backend received %d datagrams, want 1 (only the post-reload one)", got)
+	}
+}
+
+func TestLogIllegalWritesRequestLog(t *testing.T) {
+	dir := t.TempDir()
+	rl := requestlog.New(requestlog.Options{Dir: dir, RetentionDays: 30, FlushEvery: 5 * time.Millisecond})
+	t.Cleanup(rl.Stop)
+	logPath := filepath.Join(dir, "udpshunt-requests-"+time.Now().Format("2006-01-02")+".log")
+	l, _, _, met, _, _, _ := gatedStackWithLog(t, "gate-log", config.PayloadFilter{Rules: []payloadfilter.RuleConfig{gateRule}}, rl)
+
+	cli := testClient(t)
+	cliIP := cli.LocalAddr().(*net.UDPAddr).IP.String()
+
+	// ON: the illegal drop is logged with its dedicated outcome.
+	l.UpdateLogIllegal(true)
+	if _, err := cli.WriteToUDP([]byte("evil"), l.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	lines := waitLines(t, logPath, 1)
+	if len(lines) != 1 {
+		t.Fatalf("want exactly one log line, got %d", len(lines))
+	}
+	last := lines[0]
+	for _, want := range []string{`"listener":"gate-log"`, `"outcome":"illegal"`, `"client":"` + cliIP + `:`} {
+		if !strings.Contains(last, want) {
+			t.Fatalf("line %q missing %s", last, want)
+		}
+	}
+	// Backend is empty (no backend was selected), so the omitempty field is
+	// absent from the line entirely.
+	if strings.Contains(last, `"backend"`) {
+		t.Fatalf("illegal line must have no backend, got %s", last)
+	}
+
+	// OFF (the default): another illegal drop must not log.
+	l.UpdateLogIllegal(false)
+	before := len(readLogLines(t, logPath))
+	if _, err := cli.WriteToUDP([]byte("evil2"), l.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	// The drop itself was processed; the log staying silent is the point.
+	waitCounter(t, met, "udpshunt_illegal_packets_total", 2)
+	time.Sleep(200 * time.Millisecond) // a few flush cycles
+	if after := len(readLogLines(t, logPath)); after != before {
+		t.Fatalf("log_illegal=false must not log: %d -> %d lines", before, after)
 	}
 }
