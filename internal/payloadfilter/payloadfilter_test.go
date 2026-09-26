@@ -130,6 +130,26 @@ func TestAllowed(t *testing.T) {
 		}
 	})
 
+	t.Run("min_length smaller than the rule footprint", func(t *testing.T) {
+		r := mustCompile(t, []RuleConfig{{MagicHex: "aabbccdd", Offset: 4, MinLength: 2}})
+		atOffset := append([]byte{0, 0, 0, 0}, mustHex(t, "aabbccdd")...) // magic at bytes [4:8]
+		cases := []struct {
+			name string
+			pkt  []byte
+			want bool
+		}{
+			// Below offset+len(magic): the second length check must reject
+			// the packet before the pkt[4:8] slice would panic.
+			{"short packet below the rule footprint", []byte{0x01, 0x02, 0x03, 0x04, 0x05}, false},
+			{"packet carrying the magic at offset 4", atOffset, true},
+		}
+		for _, tc := range cases {
+			if got := r.Allowed(tc.pkt); got != tc.want {
+				t.Errorf("%s: Allowed(% x) = %v, want %v", tc.name, tc.pkt, got, tc.want)
+			}
+		}
+	})
+
 	t.Run("nonzero offset", func(t *testing.T) {
 		r := mustCompile(t, []RuleConfig{{MagicHex: "5763536a", Offset: 2}})
 		at := append([]byte{0x00, 0x00}, magic...) // magic at bytes [2:6]
