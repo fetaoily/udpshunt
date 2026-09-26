@@ -27,6 +27,7 @@ const (
 	OutcomeRejected      = "rejected"
 	OutcomeUpstreamError = "upstream_error"
 	OutcomeBlacklisted   = "blacklisted"
+	OutcomeIllegal       = "illegal"
 )
 
 const (

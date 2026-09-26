@@ -25,6 +25,7 @@ type Metrics struct {
 
 	sessionsCreated *prometheus.CounterVec
 	blacklisted     *prometheus.CounterVec
+	illegal         *prometheus.CounterVec
 	sessionStatsSet bool
 	reloads         prometheus.Counter
 	reloadFailures  prometheus.Counter
@@ -35,6 +36,12 @@ type Metrics struct {
 	// the app can keep a lock-free /status total. Set once at startup;
 	// called only from the packet-drop path.
 	OnBlacklisted func(int64)
+
+	// OnIllegal, when set, is invoked with each illegal-payload count
+	// alongside the udpshunt_illegal_packets_total counter, so the app can
+	// keep a lock-free /status total. Set once at startup; called only
+	// from the packet-drop path.
+	OnIllegal func(int64)
 }
 
 // New creates the registry and registers every metric family.
@@ -74,6 +81,9 @@ func New() *Metrics {
 		}, []string{"listener"}),
 		blacklisted: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
 			Name: "udpshunt_blacklisted_packets_total", Help: "Packets dropped from blacklisted clients.",
+		}, []string{"listener"}),
+		illegal: promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+			Name: "udpshunt_illegal_packets_total", Help: "Packets dropped by the payload filter.",
 		}, []string{"listener"}),
 		reloads: promauto.With(r).NewCounter(prometheus.CounterOpts{
 			Name: "udpshunt_reloads_total", Help: "Successful config reloads.",
@@ -147,6 +157,14 @@ func (lm *ListenerMetrics) Blacklisted(n int) {
 		lm.m.blacklisted.WithLabelValues(lm.name).Add(float64(n))
 		if lm.m.OnBlacklisted != nil {
 			lm.m.OnBlacklisted(int64(n))
+		}
+	}
+}
+func (lm *ListenerMetrics) Illegal(n int) {
+	if lm != nil {
+		lm.m.illegal.WithLabelValues(lm.name).Add(float64(n))
+		if lm.m.OnIllegal != nil {
+			lm.m.OnIllegal(int64(n))
 		}
 	}
 }

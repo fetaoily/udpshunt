@@ -120,6 +120,7 @@ func TestNilListenerMetricsSafe(t *testing.T) {
 	lm.BackendError("b:1")
 	lm.SessionCreated()
 	lm.Blacklisted(1)
+	lm.Illegal(1)
 }
 
 func TestOnBlacklistedHook(t *testing.T) {
@@ -134,6 +135,22 @@ func TestOnBlacklistedHook(t *testing.T) {
 	}
 	// The zero value (hook unset) must not panic.
 	New().ForListener("t").Blacklisted(1)
+}
+
+func TestIllegalCounterAndHook(t *testing.T) {
+	m := New()
+	var calls []int64
+	m.OnIllegal = func(n int64) { calls = append(calls, n) }
+	lm := m.ForListener("t")
+	lm.Illegal(3)
+	if got := metricValue(t, m, "udpshunt_illegal_packets_total", "t", ""); got != 3 {
+		t.Fatalf("illegal counter = %v, want 3", got)
+	}
+	if len(calls) != 1 || calls[0] != 3 {
+		t.Fatalf("OnIllegal calls = %v, want exactly one call with 3", calls)
+	}
+	// The zero value (hook unset) must not panic.
+	New().ForListener("t").Illegal(1)
 }
 
 func TestForListenerReusesChildren(t *testing.T) {
