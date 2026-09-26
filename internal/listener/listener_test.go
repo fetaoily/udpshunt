@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/fetaoily/udpshunt/internal/clientstats"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/metrics"
+	"github.com/fetaoily/udpshunt/internal/payloadfilter"
 	"github.com/fetaoily/udpshunt/internal/requestlog"
 	"github.com/fetaoily/udpshunt/internal/session"
 )
@@ -469,5 +471,207 @@ func TestLogBlockedWritesRequestLog(t *testing.T) {
 	time.Sleep(200 * time.Millisecond) // a few flush cycles
 	if after := len(readLogLines(t, logPath)); after != before {
 		t.Fatalf("log_blocked=false must not log: %d -> %d lines", before, after)
+	}
+}
+
+// startCountingEcho behaves like startEcho and also counts every datagram
+// it receives, so tests can prove a dropped packet never reached a backend.
+func startCountingEcho(t *testing.T) (addr string, received func() int) {
+	t.Helper()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n atomic.Int64
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			m, from, err := pc.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			n.Add(1)
+			resp := append([]byte("echo:"), buf[:m]...)
+			_, _ = pc.WriteToUDP(resp, from)
+		}
+	}()
+	t.Cleanup(func() { pc.Close() })
+	return pc.LocalAddr().String(), func() int { return int(n.Load()) }
+}
+
+// gatedStack is blacklistStack with an ingress payload filter: the listener
+// config carries pf, and the echo backend counts every datagram it receives,
+// so tests can observe which drop path a packet took and whether an illegal
+// packet ever reached a backend.
+func gatedStack(t *testing.T, name string, pf config.PayloadFilter) (*Listener, *session.Manager, *blocklist.Container, *metrics.Metrics, *clientstats.Table, *clientstats.Table, func() int) {
+	t.Helper()
+	backend, received := startCountingEcho(t)
+	lc := config.Listener{Name: name, Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute), PayloadFilter: pf}
+	mgr := session.NewManager(0)
+	bal := balancer.New(lc.Backends, balancer.Options{})
+	bl := blocklist.NewContainer()
+	met := metrics.New()
+	stats := clientstats.New(clientstats.Options{Dir: t.TempDir(), TickEvery: time.Hour, SnapshotInterval: time.Hour})
+	bstats := clientstats.New(clientstats.Options{Dir: t.TempDir(), TickEvery: time.Hour, SnapshotInterval: time.Hour})
+	t.Cleanup(stats.Stop)
+	t.Cleanup(bstats.Stop)
+	l, err := New(lc.Name, lc, bal, mgr, slog.Default(), met.ForListener(name), nil, nil, bl, bstats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Same LIFO teardown as newStack: cancel (stop receiving) -> CloseAll
+	// (unblock downstream readers) -> Close (release the frontend socket).
+	t.Cleanup(func() { _ = l.Close() })
+	t.Cleanup(func() { mgr.CloseAll() })
+	t.Cleanup(cancel)
+	go func() { _ = l.Run(ctx) }()
+	return l, mgr, bl, met, stats, bstats, received
+}
+
+// gateRule is the canonical single-rule gate used by the tests: magic
+// 00112233 at offset 0, min_length 4.
+var gateRule = payloadfilter.RuleConfig{MagicHex: "00112233", Offset: 0, MinLength: 4}
+
+func TestPayloadGateDropsNonMatchingDatagrams(t *testing.T) {
+	l, mgr, _, met, _, _, received := gatedStack(t, "gate", config.PayloadFilter{Rules: []payloadfilter.RuleConfig{gateRule}})
+
+	cli := testClient(t)
+	// No magic: dropped with no reply, no session, no backend receipt.
+	if _, err := cli.WriteToUDP([]byte("hello"), l.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	cli.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	buf := make([]byte, 65536)
+	if n, _, err := cli.ReadFromUDP(buf); err == nil {
+		t.Fatalf("illegal datagram must get no reply, got %q", buf[:n])
+	}
+	waitCounter(t, met, "udpshunt_illegal_packets_total", 1)
+	if got := received(); got != 0 {
+		t.Fatalf("backend received %d datagrams from an illegal packet", got)
+	}
+	if mgr.Count() != 0 {
+		t.Fatal("illegal datagram must not create a session")
+	}
+
+	// With the magic: normal echo reply.
+	if got := roundTrip(t, cli, l.Addr(), "\x00\x11\x22\x33payload"); got != "echo:\x00\x11\x22\x33payload" {
+		t.Fatalf("legal datagram reply = %q", got)
+	}
+
+	// Below min_length (3 bytes < 4): dropped too.
+	if _, err := cli.WriteToUDP([]byte("abc"), l.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	cli.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, _, err := cli.ReadFromUDP(buf); err == nil {
+		t.Fatalf("short datagram must be dropped, got %q", buf[:n])
+	}
+	waitCounter(t, met, "udpshunt_illegal_packets_total", 2)
+}
+
+func TestPayloadGateMultiRuleAnyOf(t *testing.T) {
+	// Second rule: magic aabb at offset 2, so "xy\xaa\xbb" matches only it.
+	pf := config.PayloadFilter{Rules: []payloadfilter.RuleConfig{
+		gateRule,
+		{MagicHex: "aabb", Offset: 2, MinLength: 4},
+	}}
+	l, _, _, met, _, _, _ := gatedStack(t, "gate2", pf)
+
+	cli := testClient(t)
+	// Matching only the second rule is enough: forwarded.
+	if got := roundTrip(t, cli, l.Addr(), "xy\xaa\xbb"); got != "echo:xy\xaa\xbb" {
+		t.Fatalf("second-rule datagram reply = %q", got)
+	}
+	if got := counterValue(t, met, "udpshunt_illegal_packets_total"); got != 0 {
+		t.Fatalf("forwarded datagram must not count as illegal, got %v", got)
+	}
+}
+
+func TestPayloadGateOffEchoesGarbage(t *testing.T) {
+	// No payload_filter section: a garbage datagram is echoed (unchanged).
+	backend := startEcho(t)
+	lc := config.Listener{Name: "nogate", Bind: "127.0.0.1:0", Backends: []string{backend}, SessionTimeout: config.Duration(time.Minute)}
+	l, _, _ := newStack(t, lc, 0)
+	client := testClient(t)
+	if got := roundTrip(t, client, l.Addr(), "garbage"); got != "echo:garbage" {
+		t.Fatalf("reply = %q", got)
+	}
+}
+
+func TestBlacklistBeatsPayloadGate(t *testing.T) {
+	l, mgr, bl, met, stats, bstats, received := gatedStack(t, "gate-bl", config.PayloadFilter{Rules: []payloadfilter.RuleConfig{gateRule}})
+
+	cli := testClient(t)
+	cliIP := cli.LocalAddr().(*net.UDPAddr).IP.String()
+	bl.Swap(blockClientAddr(t, cli))
+
+	// Non-magic garbage from a blacklisted client: the blacklist check runs
+	// first, so the packet must land in the blocked path, not the gate.
+	if _, err := cli.WriteToUDP([]byte("evil"), l.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	cli.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	buf := make([]byte, 65536)
+	if n, _, err := cli.ReadFromUDP(buf); err == nil {
+		t.Fatalf("blacklisted client must get no reply, got %q", buf[:n])
+	}
+	// The receive loop has accounted the packet as blocked by now.
+	waitCounter(t, met, "udpshunt_blacklisted_packets_total", 1)
+
+	// Blocked-path accounting only: no general counters, no general row,
+	// no session — and never the illegal path or a backend receipt.
+	if got := counterValue(t, met, "udpshunt_packets_in_total"); got != 0 {
+		t.Fatalf("packets_in counted a blocked packet: %v", got)
+	}
+	if rows, _, _ := stats.Top("requests", true, 10); len(rows) != 0 {
+		t.Fatalf("general client stats must not see a blocked packet: %+v", rows)
+	}
+	if mgr.Count() != 0 {
+		t.Fatal("blacklisted client must not create a session")
+	}
+	if got := counterValue(t, met, "udpshunt_illegal_packets_total"); got != 0 {
+		t.Fatalf("blacklisted packet must bypass the payload gate, illegal = %v", got)
+	}
+	if got := received(); got != 0 {
+		t.Fatalf("backend received %d datagrams from a blocked packet", got)
+	}
+
+	// Blocked stats recorded for that IP.
+	var row clientstats.Row
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		brows, _, _ := bstats.Top("requests", true, 10)
+		if len(brows) == 1 && brows[0].IP == cliIP && brows[0].Requests >= 1 {
+			row = brows[0]
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if row.IP != cliIP || row.Requests < 1 {
+		t.Fatalf("blocked stats missing for %s: %+v", cliIP, row)
+	}
+}
+
+func TestUpdateRulesNilReopensGate(t *testing.T) {
+	l, _, _, met, _, _, received := gatedStack(t, "gate-off", config.PayloadFilter{Rules: []payloadfilter.RuleConfig{gateRule}})
+
+	cli := testClient(t)
+	// Gate on: garbage dropped.
+	if _, err := cli.WriteToUDP([]byte("garbage"), l.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	waitCounter(t, met, "udpshunt_illegal_packets_total", 1)
+
+	// Reload to no rules: the gate opens and garbage flows again.
+	l.UpdateRules(nil)
+	if got := roundTrip(t, cli, l.Addr(), "garbage"); got != "echo:garbage" {
+		t.Fatalf("after UpdateRules(nil): %q", got)
+	}
+	if got := counterValue(t, met, "udpshunt_illegal_packets_total"); got != 1 {
+		t.Fatalf("illegal must stay at the pre-reload packet, got %v", got)
+	}
+	if got := received(); got != 1 {
+		t.Fatalf("backend received %d datagrams, want 1 (only the post-reload one)", got)
 	}
 }

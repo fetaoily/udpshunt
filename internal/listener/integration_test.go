@@ -13,6 +13,7 @@ import (
 	"github.com/fetaoily/udpshunt/internal/balancer"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/metrics"
+	"github.com/fetaoily/udpshunt/internal/payloadfilter"
 	"github.com/fetaoily/udpshunt/internal/session"
 )
 
@@ -295,4 +296,35 @@ func TestRelayReadErrorAttributed(t *testing.T) {
 	eventually(t, 5*time.Second, "relay_read error attributed", func() bool {
 		return stateOf(bal, dead).LastErrorSource == balancer.SrcRelayRead
 	})
+}
+
+// TestPayloadGateEndToEnd (spec §9 integration row): with the gate on, an
+// illegal datagram gets no reply and the backend receive counter stays put;
+// a legal frame round-trips normally.
+func TestPayloadGateEndToEnd(t *testing.T) {
+	gate := payloadfilter.RuleConfig{MagicHex: "00112233", Offset: 0, MinLength: 4}
+	l, _, _, met, _, _, received := gatedStack(t, "gate-e2e", config.PayloadFilter{Rules: []payloadfilter.RuleConfig{gate}})
+
+	cli := testClient(t)
+	// Legal frame first: normal echo, backend saw exactly one datagram.
+	if got := roundTrip(t, cli, l.Addr(), "\x00\x11\x22\x33ping"); got != "echo:\x00\x11\x22\x33ping" {
+		t.Fatalf("legal reply = %q", got)
+	}
+	if got := received(); got != 1 {
+		t.Fatalf("backend received %d datagrams, want 1", got)
+	}
+
+	// Illegal datagram: no reply, and the backend counter stays put.
+	if _, err := cli.WriteToUDP([]byte("no-magic"), l.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	cli.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	buf := make([]byte, 65536)
+	if n, _, err := cli.ReadFromUDP(buf); err == nil {
+		t.Fatalf("illegal datagram must get no reply, got %q", buf[:n])
+	}
+	waitCounter(t, met, "udpshunt_illegal_packets_total", 1)
+	if got := received(); got != 1 {
+		t.Fatalf("backend counter moved to %d on an illegal datagram, want 1", got)
+	}
 }

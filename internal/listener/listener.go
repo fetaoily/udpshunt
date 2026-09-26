@@ -18,6 +18,7 @@ import (
 	"github.com/fetaoily/udpshunt/internal/clientstats"
 	"github.com/fetaoily/udpshunt/internal/config"
 	"github.com/fetaoily/udpshunt/internal/metrics"
+	"github.com/fetaoily/udpshunt/internal/payloadfilter"
 	"github.com/fetaoily/udpshunt/internal/pktio"
 	"github.com/fetaoily/udpshunt/internal/requestlog"
 	"github.com/fetaoily/udpshunt/internal/session"
@@ -43,6 +44,8 @@ type Listener struct {
 	resolved     map[string]*net.UDPAddr // backend address -> pre-resolved address
 
 	logBlocked atomic.Bool
+	rules      atomic.Pointer[payloadfilter.Rules]
+	logIllegal atomic.Bool
 
 	mu        sync.Mutex // guards stopped, waiters, timeout and the wg.Add in startDownstream
 	stopped   bool       // set once draining: no new downstream goroutines
@@ -83,7 +86,14 @@ func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.
 		}
 		resolved[b] = ra
 	}
-	return &Listener{
+	rules, err := payloadfilter.Compile(cfg.PayloadFilter.Rules)
+	if err != nil {
+		// Unreachable via config.Load (Validate compiles first); guards
+		// programmatic callers that skip validation.
+		pc.Close()
+		return nil, fmt.Errorf("listener %q: compile payload filter: %w", name, err)
+	}
+	l := &Listener{
 		name:         name,
 		pc:           pc,
 		io:           pktio.Wrap(pc),
@@ -97,7 +107,10 @@ func New(name string, cfg config.Listener, bal *balancer.Balancer, mgr *session.
 		timeout:      time.Duration(cfg.SessionTimeout),
 		logger:       logger.With("listener", name),
 		resolved:     resolved,
-	}, nil
+	}
+	l.rules.Store(rules)
+	l.logIllegal.Store(cfg.PayloadFilter.LogIllegal)
+	return l, nil
 }
 
 // Addr returns the bound address (useful with :0 binds in tests).
@@ -124,6 +137,14 @@ func (l *Listener) UpdateTimeout(d time.Duration) {
 func (l *Listener) UpdateLogBlocked(v bool) {
 	l.logBlocked.Store(v)
 }
+
+// UpdateRules swaps the compiled payload-filter gate (COW). A nil snapshot
+// disables the gate.
+func (l *Listener) UpdateRules(r *payloadfilter.Rules) { l.rules.Store(r) }
+
+// UpdateLogIllegal toggles whether illegal-payload drops are written to the
+// request log. Default off.
+func (l *Listener) UpdateLogIllegal(v bool) { l.logIllegal.Store(v) }
 
 // Run receives packets until ctx is cancelled. Cancellation stops the receive
 // loop without closing the socket: it must stay writable for the downstream
@@ -179,6 +200,24 @@ func (l *Listener) Run(ctx context.Context) error {
 						continue
 					}
 				}
+			}
+			// Payload gate: a datagram matching no rule is dropped with the
+			// same accounting discipline as blacklisted packets (spec §9 of
+			// the blacklist design): silent, dedicated counter only, no
+			// session, no general stats, no debug logging.
+			if pf := l.rules.Load(); pf != nil && !pf.Allowed(bufs[i][:sizes[i]]) {
+				l.met.Illegal(1)
+				if l.logIllegal.Load() && l.reqLog != nil {
+					l.reqLog.Record(requestlog.Entry{
+						Time:     time.Now(),
+						Listener: l.name,
+						Client:   addrs[i].String(),
+						Backend:  "",
+						Bytes:    sizes[i],
+						Outcome:  requestlog.OutcomeIllegal,
+					})
+				}
+				continue
 			}
 			l.met.PacketsIn(1)
 			l.met.BytesIn(sizes[i])
