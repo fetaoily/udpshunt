@@ -6,8 +6,8 @@
 
 ## 1. 背景与目标
 
-生产部署（bdhg，room-temp 监听器 `0.0.0.0:3333`）对公网开放：任何客户端 IP 都能
-创建会话、占用 fd 与后端配额。需要按客户端 IP 拒绝服务：
+生产环境面向公网开放的 listener：任何客户端 IP 都能创建会话、占用 fd 与后端配额。
+需要按客户端 IP 拒绝服务：
 
 - G1 拦截：黑名单内 IP 的数据包在转发前**静默丢弃**（UDP 无回应），不建会话。
 - G2 拉黑即断：IP 进入名单时，其**存量会话立即关闭**。
@@ -23,7 +23,7 @@
 
 - 自动拉黑 / fail2ban 式速率封禁（client_stats 已具备数据基础，留 v2）。
 - 名单持久化：运行时增删不落盘，重启后只剩配置文件条目（要长久的条目写进 YAML）。
-- 每 listener 独立名单（v1 全局一份；现有部署三个 listener 指向同一批后端，全局
+- 每 listener 独立名单（v1 全局一份；现有部署多个 listener 指向同一批后端，全局
   语义即"封 IP"本意）。
 - 管理端口鉴权（既有立场不变：9155 绑 127.0.0.1，README 已警示）。
 - 前缀 trie：条目量级按百以内设计，线性扫前缀即可（YAGNI）。
@@ -137,7 +137,7 @@ App 持有：`blocklist *blocklist.Container`（全局一份，各 listener 共�
 `blacklist.log_blocked: true` 时，每个被拦包写一条 request_log：
 
 ```json
-{"time":"...","listener":"room-temp","client":"203.0.113.7:51820","backend":"","bytes":74,"outcome":"blacklisted"}
+{"time":"...","listener":"edge-ingest","client":"203.0.113.7:51820","backend":"","bytes":74,"outcome":"blacklisted"}
 ```
 
 `requestlog` 增加 `OutcomeBlacklisted` 常量。**默认必须为 false**：攻击流量下该
