@@ -17,6 +17,12 @@ listeners:
       timeout: 1s
       rise: 2
       fall: 3
+    # payload_filter:            # optional ingress gate; absent = disabled
+    #   rules:
+    #     - magic_hex: "00112233"  # example placeholder; use your protocol's
+    #       offset: 0              #   magic as wire-order hex
+    #       min_length: 8          # default: offset + len(magic)
+    #   log_illegal: false         # true: one request-log line per drop
 
 sessions:
   timeout: 60s

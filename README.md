@@ -306,6 +306,68 @@ Under an active attack that is one line per attack packet per second,
 matching the attack rate. Keep it off except for targeted, low-volume
 auditing.
 
+### Payload filter
+
+The optional per-listener `payload_filter` is an ingress allowlist on the
+payload's leading bytes: a datagram is forwarded only when it matches at
+least one rule's magic bytes (any-of semantics). Non-matching datagrams
+are dropped silently before session lookup and accounting — no session,
+no reply, and no trace in the normal packet counters or the clients view
+— the same discipline as the blacklist. When the section is absent or
+`rules` is empty, the gate is off and every packet is forwarded.
+
+```yaml
+listeners:
+  - name: udp-in
+    bind: 0.0.0.0:9000
+    backends: [10.0.0.1:9000]
+    payload_filter:
+      rules:
+        - magic_hex: "00112233" # placeholder: the real value comes from
+                                # your protocol spec, as wire-order hex
+          offset: 0             # byte position of the magic, for magics
+                                # that do not start at 0
+          min_length: 8         # shortest legal datagram; default when
+                                # omitted: offset + len(magic)
+      log_illegal: false        # request-log every dropped packet
+```
+
+Each rule compares `magic_hex` against the bytes at `offset` in every
+datagram. Set `offset` when the magic does not start at byte 0, and
+`min_length` when legal traffic has a minimum size beyond the magic
+itself — omitted, it defaults to `offset + len(magic)`, so any datagram
+long enough to carry the magic is legal. Rules are compiled at config
+load: a rule that does not compile (bad hex, empty magic, negative
+values) fails the whole config, at startup and on `/reload`.
+
+Reload. `/reload` hot-swaps the compiled rules (one
+`payload_filter_reloaded` event per listener). Tightening the rules does
+not kill established sessions: their further packets are dropped at the
+gate like any other illegal datagram, so the sessions idle out through
+`session_timeout`. Removing the section (or emptying `rules`) disables
+the gate on the next reload.
+
+Observability: dropped packets accumulate in the
+`udpshunt_illegal_packets_total` metric (label `listener`), `/status`
+carries an `illegal_packets` total, and the TUI header shows `illegal N`
+while packets are being dropped. With `log_illegal: true` each drop is
+request-logged with `"outcome":"illegal"`.
+
+**`log_illegal: true` writes one request-log line per dropped packet.**
+Under an active attack that is one line per attack packet per second,
+matching the attack rate. Keep it off except for targeted, low-volume
+auditing.
+
+Before enabling the gate in production, confirm the on-wire magic bytes
+and the attack profile with a packet capture on the listener port:
+
+    tcpdump -i eth0 -s0 -X -c 30 'udp port 9000'
+
+The same capture shows how much live traffic the rules would drop. The
+gate is an allowlist, not a behavior filter: it only blocks traffic that
+lacks the magic — a client that forges a valid signature passes, and
+dealing with such hosts is the [blacklist's](#blacklist) job.
+
 ### Balancing modes
 
 `balance` selects how new sessions pick a backend:
