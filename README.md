@@ -179,9 +179,11 @@ Each line records the packet with its outcome:
 ```
 
 `outcome` is one of `forwarded`, `no_backend` (empty backend pool),
-`rejected` (session cap reached) or `upstream_error` (dial or write to the
-backend failed). At day rollover the previous day's file is gzip-compressed
-in the background (`*.log.gz`); files older than `retention_days` are
+`rejected` (session cap reached), `upstream_error` (dial or write to the
+backend failed), `blacklisted` (dropped by the client-IP blacklist) or
+`illegal` (dropped by the listener's payload filter). At day rollover the
+previous day's file is gzip-compressed in the background (`*.log.gz`);
+files older than `retention_days` are
 deleted at startup and once per day. The log never slows the proxy: entries
 go through a bounded in-memory queue, and when the queue fills (disk slower
 than traffic) entries are dropped and counted — the drop total is exposed
@@ -296,8 +298,8 @@ Observability: dropped packets accumulate in the
 `udpshunt_blacklisted_packets_total` metric (label `listener`), `/status`
 carries a `blacklist` block, and the event stream reports
 `blacklist_added`, `blacklist_removed`, `blacklist_enforced` and
-`blacklist_reloaded`. The TUI dashboard header shows `blocked N` while
-packets are being dropped, and the `b` key in the TUI clients view toggles
+`blacklist_reloaded`. The TUI dashboard header shows the accumulated
+`blocked N`, and the `b` key in the TUI clients view toggles
 the blocked-clients table (`GET /clients?scope=blocked` is the API
 equivalent).
 
@@ -349,8 +351,8 @@ the gate on the next reload.
 
 Observability: dropped packets accumulate in the
 `udpshunt_illegal_packets_total` metric (label `listener`), `/status`
-carries an `illegal_packets` total, and the TUI header shows `illegal N`
-while packets are being dropped. With `log_illegal: true` each drop is
+carries an `illegal_packets` total, and the TUI header shows the
+accumulated `illegal N`. With `log_illegal: true` each drop is
 request-logged with `"outcome":"illegal"`.
 
 **`log_illegal: true` writes one request-log line per dropped packet.**
@@ -455,7 +457,8 @@ serving.
 `admin.bind` serves eight routes:
 
 - `GET /metrics` — Prometheus text format (private registry, `udpshunt_` prefix).
-- `GET /status` — JSON snapshot: uptime, per-listener backends (health, session counts, plus per-backend `suspect`, `err_count`, `last_error` and `confirmed_by`; `confirmed_by` reflects the most recent down and persists after recovery, so it is meaningful only while the backend is down), session totals, request-log state (`dropped` counter), blacklist state (canonical entries and the blocked-packet total), recent events, and per-listener rate history (last 5 min at 1s samples).
+- `GET /status` — JSON snapshot: uptime, per-listener backends (health, session counts, plus per-backend `suspect`, `err_count`, `last_error` and `confirmed_by`; `confirmed_by` reflects the most recent down and persists after recovery, so it is meaningful only while the backend is down), session totals, request-log state (`dropped` counter), blacklist state (canonical entries and the blocked-packet total), the
+payload filter's `illegal_packets` drop total, recent events, and per-listener rate history (last 5 min at 1s samples).
 - `GET /clients` — per-client-IP table (`?sort=<column>&order=asc|desc&limit=<n>`, default `requests`/`desc`/200; columns: `ip`, `requests`, `responses`, `bytes_in`, `bytes_out`, `pps_in`, `bps_in`, `bps_out`, `last_seen`). Returns `{enabled, tracked, evicted, rows}`.
 - `GET`/`POST`/`DELETE /blacklist` — runtime client-IP blocking (see [Blacklist](#blacklist)).
 - `POST /reload` — reload the config file and apply it.
@@ -468,6 +471,9 @@ serving.
 Scrape `GET /metrics` on the admin port. Families:
 `udpshunt_packets_in_total`, `udpshunt_bytes_in_total`,
 `udpshunt_packets_out_total`, `udpshunt_bytes_out_total` (label `listener`);
+`udpshunt_blacklisted_packets_total` (label `listener`; packets dropped by
+the client-IP blacklist), `udpshunt_illegal_packets_total` (label
+`listener`; packets dropped by the payload filter);
 `udpshunt_backend_packets_in_total`, `udpshunt_backend_packets_out_total`,
 `udpshunt_backend_errors_total`, `udpshunt_backend_healthy`,
 `udpshunt_backend_state_changes_total` (labels `listener`, `backend`);
