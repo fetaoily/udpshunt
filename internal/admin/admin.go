@@ -61,12 +61,13 @@ func (r *Recorder) List() []Event {
 
 // Status is the JSON shape of GET /status (spec §8).
 type Status struct {
-	Uptime     string            `json:"uptime"`
-	Listeners  []ListenerStatus  `json:"listeners"`
-	Sessions   SessionsStatus    `json:"sessions"`
-	RequestLog *RequestLogStatus `json:"request_log,omitempty"`
-	Blacklist  *BlacklistStatus  `json:"blacklist,omitempty"`
-	Events     []Event           `json:"events"`
+	Uptime         string            `json:"uptime"`
+	Listeners      []ListenerStatus  `json:"listeners"`
+	Sessions       SessionsStatus    `json:"sessions"`
+	RequestLog     *RequestLogStatus `json:"request_log,omitempty"`
+	Blacklist      *BlacklistStatus  `json:"blacklist,omitempty"`
+	IllegalPackets int64             `json:"illegal_packets"`
+	Events         []Event           `json:"events"`
 }
 
 // BlacklistStatus is the JSON shape of GET /blacklist and of the /status

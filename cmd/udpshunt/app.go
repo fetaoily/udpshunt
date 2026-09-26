@@ -22,6 +22,7 @@ import (
 	"github.com/fetaoily/udpshunt/internal/health"
 	"github.com/fetaoily/udpshunt/internal/listener"
 	"github.com/fetaoily/udpshunt/internal/metrics"
+	"github.com/fetaoily/udpshunt/internal/payloadfilter"
 	"github.com/fetaoily/udpshunt/internal/rates"
 	"github.com/fetaoily/udpshunt/internal/requestlog"
 	"github.com/fetaoily/udpshunt/internal/session"
@@ -62,6 +63,10 @@ type App struct {
 	// Both lock-free.
 	blBlocked atomic.Int64
 	blWatch   atomic.Pointer[blWatchCfg]
+
+	// illegalPackets totals payload-filter drops for /status (fed by the
+	// metrics hook). Lock-free, like blBlocked.
+	illegalPackets atomic.Int64
 
 	// onDown maps listener name -> on_down policy. Copy-on-write atomic:
 	// state-change callbacks fire while Apply/updateListenerLocked holds
@@ -118,6 +123,7 @@ func NewApp(cfgPath string, logger *slog.Logger) *App {
 	}
 	a.onDown.Store(&map[string]string{})
 	met.OnBlacklisted = func(n int64) { a.blBlocked.Add(n) }
+	met.OnIllegal = func(n int64) { a.illegalPackets.Add(n) }
 	return a
 }
 
@@ -660,6 +666,16 @@ func (a *App) updateListenerLocked(lc config.Listener) {
 	bal.SetBalance(lc.Balance)
 	bal.SetHealth(healthEnabled(lc.HealthCheck), lc.HealthCheck.Rise, lc.HealthCheck.Fall)
 	a.listeners[lc.Name].UpdateTimeout(time.Duration(lc.SessionTimeout))
+	// Payload gate: config.Load already compiled these rules (Validate),
+	// so Compile here cannot fail; on the defensive branch keep the old
+	// gate rather than dropping packets on a nil snapshot mismatch.
+	if rules, err := payloadfilter.Compile(lc.PayloadFilter.Rules); err != nil {
+		a.logger.Error("payload filter recompile failed, keeping previous rules", "listener", lc.Name, "err", err)
+	} else {
+		a.listeners[lc.Name].UpdateRules(rules)
+		a.listeners[lc.Name].UpdateLogIllegal(lc.PayloadFilter.LogIllegal)
+		a.events.Add("payload_filter_reloaded", fmt.Sprintf("%s rules=%d", lc.Name, rules.Len()))
+	}
 	a.startProbeLocked(a.lctxs[lc.Name], lc)
 	a.events.Add("listener_updated", lc.Name)
 }
@@ -742,7 +758,8 @@ func (a *App) Status() admin.Status {
 			Expired:  a.mgr.Expired(),
 			Rejected: a.mgr.Rejected(),
 		},
-		Events: a.events.List(),
+		IllegalPackets: a.illegalPackets.Load(),
+		Events:         a.events.List(),
 	}
 	if a.reqLog != nil {
 		st.RequestLog = &admin.RequestLogStatus{

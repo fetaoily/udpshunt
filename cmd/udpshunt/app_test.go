@@ -1333,3 +1333,129 @@ func TestBlacklistFileSortedOnWrite(t *testing.T) {
 		t.Fatalf("file order after delete = %v", got)
 	}
 }
+
+// payloadListenerCfg writes a one-listener config whose ingress gate allows
+// payloads starting with the given hex magic at offset 0 (empty magic = no
+// payload_filter section = gate off).
+func payloadListenerCfg(t *testing.T, backend, magicHex string) string {
+	t.Helper()
+	pf := ""
+	if magicHex != "" {
+		pf = fmt.Sprintf("    payload_filter:\n      rules:\n        - magic_hex: \"%s\"\n          offset: 0\n", magicHex)
+	}
+	return writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", backend), pf))
+}
+
+// The payload gate end to end: /status counts drops, a reload swaps the gate
+// in place (same bind -> updateListenerLocked), and a rule-less reload turns
+// the gate off with a rules=0 event.
+func TestPayloadGateStatusAndReload(t *testing.T) {
+	b1 := startEcho(t)
+	pA := payloadListenerCfg(t, b1, "aabb")
+	app, _ := newApp(t, pA)
+	if err := app.Apply(context.Background(), mustLoad(t, pA)); err != nil {
+		t.Fatal(err)
+	}
+	l1 := app.listeners["L1"].Addr()
+
+	legal := "\xaa\xbbhi"
+	if got, err := roundTripUDP(t, l1, legal); err != nil || got != "echo:"+legal {
+		t.Fatalf("legal datagram must pass the gate: %q %v", got, err)
+	}
+	if got, err := roundTripUDP(t, l1, "junk"); err == nil {
+		t.Fatalf("illegal datagram must get no reply, got %q", got)
+	}
+	waitFor(t, func() bool { return app.Status().IllegalPackets == 1 })
+	// The json tag and always-serialized shape are pinned through the raw
+	// /status JSON, not just the Go struct.
+	raw, err := json.Marshal(app.Status())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var top map[string]any
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := top["illegal_packets"].(float64); !ok || n != 1 {
+		t.Fatalf("illegal_packets = %v in %s, want 1", top["illegal_packets"], raw)
+	}
+
+	// Tightened rules: the old legal payload no longer matches, so it now
+	// drops, and the reload records the new rules count.
+	pB := payloadListenerCfg(t, b1, "ccdd")
+	if err := app.Apply(context.Background(), mustLoad(t, pB)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := roundTripUDP(t, l1, legal); err == nil {
+		t.Fatalf("tightened gate must drop the old legal datagram, got %q", got)
+	}
+	waitFor(t, func() bool { return app.Status().IllegalPackets == 2 })
+	sawTightened := false
+	for _, e := range app.events.List() {
+		if e.Kind == "payload_filter_reloaded" && strings.Contains(e.Detail, "L1 rules=1") {
+			sawTightened = true
+		}
+	}
+	if !sawTightened {
+		t.Fatalf("payload_filter_reloaded rules=1 event missing: %+v", app.events.List())
+	}
+
+	// No rules: gate off, garbage flows, event carries rules=0.
+	pC := payloadListenerCfg(t, b1, "")
+	if err := app.Apply(context.Background(), mustLoad(t, pC)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := roundTripUDP(t, l1, "junk"); err != nil || got != "echo:junk" {
+		t.Fatalf("gate must be off after the rule-less reload: %q %v", got, err)
+	}
+	sawOff := false
+	for _, e := range app.events.List() {
+		if e.Kind == "payload_filter_reloaded" && strings.Contains(e.Detail, "L1 rules=0") {
+			sawOff = true
+		}
+	}
+	if !sawOff {
+		t.Fatalf("payload_filter_reloaded rules=0 event missing: %+v", app.events.List())
+	}
+}
+
+// A config whose payload rule does not compile fails the reload (reload_failed
+// path) and leaves the running gate exactly as it was.
+func TestReloadInvalidPayloadRuleKeepsGate(t *testing.T) {
+	b1 := startEcho(t)
+	pA := payloadListenerCfg(t, b1, "aabb")
+	app, _ := newApp(t, pA)
+	if err := app.Apply(context.Background(), mustLoad(t, pA)); err != nil {
+		t.Fatal(err)
+	}
+	l1 := app.listeners["L1"].Addr()
+	if got, err := roundTripUDP(t, l1, "\xaa\xbbok"); err != nil || got != "echo:\xaa\xbbok" {
+		t.Fatalf("setup round trip: %q %v", got, err)
+	}
+
+	pB := writeCfg(t, cfgYAML(fmt.Sprintf(
+		"  - name: L1\n    bind: 127.0.0.1:0\n    backends: [%s]\n", b1),
+		"    payload_filter:\n      rules:\n        - magic_hex: \"zz\"\n"))
+	app.cfgPath = pB
+	if err := app.Reload(); err == nil {
+		t.Fatal("reload with an uncompilable payload rule must fail")
+	}
+	sawFailed := false
+	for _, e := range app.events.List() {
+		if e.Kind == "reload_failed" {
+			sawFailed = true
+		}
+	}
+	if !sawFailed {
+		t.Fatalf("reload_failed event missing: %+v", app.events.List())
+	}
+	// The running gate is untouched: the old legal payload still passes and
+	// garbage still drops.
+	if got, err := roundTripUDP(t, l1, "\xaa\xbbback"); err != nil || got != "echo:\xaa\xbbback" {
+		t.Fatalf("previous rules must keep serving after the failed reload: %q %v", got, err)
+	}
+	if got, err := roundTripUDP(t, l1, "junk"); err == nil {
+		t.Fatalf("gate must still drop non-matching datagrams, got %q", got)
+	}
+}

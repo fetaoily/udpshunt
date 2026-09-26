@@ -56,7 +56,9 @@ func TestStatusEndpoint(t *testing.T) {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	for _, want := range []string{`"listeners"`, `"b:1"`, `"healthy":true`, `"active":3`, `"reload"`} {
+	// illegal_packets is a plain always-serialized field: present even at
+	// its zero value (no omitempty).
+	for _, want := range []string{`"listeners"`, `"b:1"`, `"healthy":true`, `"active":3`, `"reload"`, `"illegal_packets":0`} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("status body missing %q: %s", want, body)
 		}
