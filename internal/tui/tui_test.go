@@ -306,6 +306,31 @@ func TestDashboardBlockedCount(t *testing.T) {
 	}
 }
 
+func TestDashboardIllegalCount(t *testing.T) {
+	sample := func(illegal int64) model {
+		return model{status: &admin.Status{
+			Uptime:         "1s",
+			IllegalPackets: illegal,
+		}}
+	}
+	// The header line is the one starting with "uptime"; isolating it keeps
+	// the assertion on the dashboard header segment itself.
+	headerLine := func(v string) string {
+		for _, line := range strings.Split(v, "\n") {
+			if strings.HasPrefix(line, "uptime ") {
+				return line
+			}
+		}
+		return ""
+	}
+	if h := headerLine(sample(3).View()); !contains(h, "illegal 3") {
+		t.Fatalf("illegal drops must mark the header line: %q", h)
+	}
+	if h := headerLine(sample(0).View()); contains(h, "illegal") {
+		t.Fatalf("status without illegal drops must not show illegal: %q", h)
+	}
+}
+
 func TestUniqueBackendHealth(t *testing.T) {
 	st := admin.Status{Listeners: []admin.ListenerStatus{
 		{Name: "watchdog", Backends: []admin.BackendStatus{

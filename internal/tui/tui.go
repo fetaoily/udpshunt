@@ -199,9 +199,13 @@ func (m model) View() string {
 	if st.Blacklist != nil && st.Blacklist.BlockedPackets > 0 {
 		blocked = fmt.Sprintf("   blocked %d", st.Blacklist.BlockedPackets)
 	}
-	fmt.Fprintf(&b, "uptime %s   sessions %d   backends %d/%d up   in %s/s (%.0f pps)   out %s/s (%.0f pps)%s\n\n",
+	illegal := ""
+	if st.IllegalPackets > 0 {
+		illegal = fmt.Sprintf("   illegal %d", st.IllegalPackets)
+	}
+	fmt.Fprintf(&b, "uptime %s   sessions %d   backends %d/%d up   in %s/s (%.0f pps)   out %s/s (%.0f pps)%s%s\n\n",
 		st.Uptime, st.Sessions.Active, healthy, total,
-		humanBytes(tv.InBPS), tv.InPPS, humanBytes(tv.OutBPS), tv.OutPPS, blocked)
+		humanBytes(tv.InBPS), tv.InPPS, humanBytes(tv.OutBPS), tv.OutPPS, blocked, illegal)
 
 	for _, row := range listenerRows(historyMap(st), st.Listeners, 40) {
 		fmt.Fprintf(&b, "%s  %s  %s  sessions %d  backends %d/%d\n",
