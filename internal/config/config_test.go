@@ -433,6 +433,91 @@ func TestOnDownValidation(t *testing.T) {
 	}
 }
 
+const pfListener = `
+listeners:
+  - name: t
+    bind: 127.0.0.1:0
+    backends: [127.0.0.1:65001]
+`
+
+func TestPayloadFilterSection(t *testing.T) {
+	c, err := Load(writeConfig(t, pfListener+`
+    payload_filter:
+      rules:
+        - magic_hex: "00112233"
+          offset: 0
+          min_length: 8
+      log_illegal: true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pf := c.Listeners[0].PayloadFilter
+	if len(pf.Rules) != 1 {
+		t.Fatalf("want 1 rule, got %d", len(pf.Rules))
+	}
+	r := pf.Rules[0]
+	if r.MagicHex != "00112233" || r.Offset != 0 || r.MinLength != 8 {
+		t.Fatalf("bad rule: %+v", r)
+	}
+	if !pf.LogIllegal {
+		t.Fatal("log_illegal must parse")
+	}
+}
+
+func TestPayloadFilterMinLengthOmitted(t *testing.T) {
+	// min_length omitted stays 0 in the config; Compile fills it in (covered
+	// by the payloadfilter package tests), config parsing must not.
+	c, err := Load(writeConfig(t, pfListener+`
+    payload_filter:
+      rules:
+        - magic_hex: "00112233"
+          offset: 4
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := c.Listeners[0].PayloadFilter.Rules[0]
+	if r.MagicHex != "00112233" || r.Offset != 4 || r.MinLength != 0 {
+		t.Fatalf("rule must keep min_length 0, got %+v", r)
+	}
+}
+
+func TestPayloadFilterAbsent(t *testing.T) {
+	c, err := Load(writeConfig(t, pfListener))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Listeners[0].PayloadFilter.Rules) != 0 || c.Listeners[0].PayloadFilter.LogIllegal {
+		t.Fatalf("absent section must be the zero value, got %+v", c.Listeners[0].PayloadFilter)
+	}
+}
+
+func TestPayloadFilterValidationErrors(t *testing.T) {
+	cases := map[string]string{
+		"bad hex":         "    payload_filter:\n      rules:\n        - magic_hex: \"zz\"\n",
+		"negative offset": "    payload_filter:\n      rules:\n        - magic_hex: \"00112233\"\n          offset: -1\n",
+		"negative length": "    payload_filter:\n      rules:\n        - magic_hex: \"00112233\"\n          min_length: -1\n",
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, pfListener+yaml))
+			if err == nil {
+				t.Fatalf("expected error for %s", name)
+			}
+			if !strings.HasPrefix(err.Error(), "invalid config: ") {
+				t.Fatalf("error for %s did not come from Validate: %v", name, err)
+			}
+			if !strings.Contains(err.Error(), "listeners[0] (t)") {
+				t.Fatalf("error for %s missing listener prefix: %v", name, err)
+			}
+			if !strings.Contains(err.Error(), "payload_filter") {
+				t.Fatalf("error for %s missing payload_filter: %v", name, err)
+			}
+		})
+	}
+}
+
 func TestBlacklistValidation(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "bl.txt")

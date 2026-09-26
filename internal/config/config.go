@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/fetaoily/udpshunt/internal/blocklist"
+	"github.com/fetaoily/udpshunt/internal/payloadfilter"
 )
 
 // Duration wraps time.Duration so YAML accepts values like "60s".
@@ -44,14 +45,15 @@ type Config struct {
 }
 
 type Listener struct {
-	Name           string      `yaml:"name"`
-	Bind           string      `yaml:"bind"`
-	Backends       []string    `yaml:"backends"`
-	Balance        string      `yaml:"balance"`
-	SessionTimeout Duration    `yaml:"session_timeout"`
-	HealthCheck    HealthCheck `yaml:"health_check"`
-	ReadBuffer     int         `yaml:"read_buffer"` // SO_RCVBUF bytes; 0 -> listener default
-	OnDown         string      `yaml:"on_down"`     // close (default) | drain: keep live sessions until timeout on down
+	Name           string        `yaml:"name"`
+	Bind           string        `yaml:"bind"`
+	Backends       []string      `yaml:"backends"`
+	Balance        string        `yaml:"balance"`
+	SessionTimeout Duration      `yaml:"session_timeout"`
+	HealthCheck    HealthCheck   `yaml:"health_check"`
+	ReadBuffer     int           `yaml:"read_buffer"`    // SO_RCVBUF bytes; 0 -> listener default
+	OnDown         string        `yaml:"on_down"`        // close (default) | drain: keep live sessions until timeout on down
+	PayloadFilter  PayloadFilter `yaml:"payload_filter"` // absent = no ingress gating
 }
 
 type Sessions struct {
@@ -116,6 +118,14 @@ type Blacklist struct {
 	File          string   `yaml:"file"`
 	WatchInterval Duration `yaml:"watch_interval"` // >= 0; 0 = no watch
 	LogBlocked    bool     `yaml:"log_blocked"`
+}
+
+// PayloadFilter configures a listener's ingress payload gate: a datagram is
+// forwarded only when it matches at least one rule's magic bytes. The zero
+// value (section absent or no rules) disables the gate.
+type PayloadFilter struct {
+	Rules      []payloadfilter.RuleConfig `yaml:"rules"`
+	LogIllegal bool                       `yaml:"log_illegal"`
 }
 
 // Load reads the YAML file at path, applies defaults, and validates the result.
@@ -286,6 +296,15 @@ func (c Config) Validate() error {
 		case "", "close", "drain":
 		default:
 			return fmt.Errorf("listeners[%d] (%s): on_down must be close or drain, got %q", i, l.Name, l.OnDown)
+		}
+		// Payload filter validation is conditional: the zero value (section
+		// absent or rules empty) disables the gate and passes trivially.
+		// Compile here so a bad rule rejects the whole config (fail-closed,
+		// same as blacklist entries).
+		if len(l.PayloadFilter.Rules) > 0 {
+			if _, err := payloadfilter.Compile(l.PayloadFilter.Rules); err != nil {
+				return fmt.Errorf("listeners[%d] (%s): payload_filter: %w", i, l.Name, err)
+			}
 		}
 	}
 	if c.Sessions.Max < 0 {
